@@ -37,9 +37,7 @@ A Home Assistant custom integration for controlling Lionel LionChief Bluetooth l
 - **Forward**: Set locomotive direction to forward
 - **Reverse**: Set locomotive direction to reverse
 - **Disconnect**: Disconnect from locomotive
-- **Announcements**: Various conductor announcements
-  - Random, Ready to Roll, Hey There, Squeaky
-  - Water and Fire, Fastest Freight, Penna Flyer
+- **Announcements**: Various calls (depends on train model)
 
 ### Binary Sensor
 - **Connection**: Shows Bluetooth connection status
