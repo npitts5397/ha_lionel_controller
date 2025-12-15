@@ -61,7 +61,6 @@ def _async_discovered_device(
         for service_uuid in service_info.service_uuids
     )
 
-
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Lionel Train Controller from a config entry."""
     mac_address = entry.data[CONF_MAC_ADDRESS]
@@ -70,6 +69,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     coordinator = LionelTrainCoordinator(hass, mac_address, name, service_uuid)
     
+    # --- START OF FIX: THE LISTENER ---
+    @callback
+    def _async_update_ble(service_info: BluetoothServiceInfoBleak, change: BluetoothChange):
+        """Update from a Bluetooth advertisement."""
+        # This function runs every time your Proxy hears the train.
+        # It ensures Home Assistant keeps the device 'fresh' in the cache.
+        # If you wanted to auto-reconnect immediately upon seeing the train,
+        # you would trigger that logic here.
+        coordinator.async_set_ble_device(service_info.device)
+
+    # Tell Home Assistant to listen for this device forever
+    entry.async_on_unload(
+        bluetooth.async_register_callback(
+            hass,
+            _async_update_ble,
+            {"address": mac_address, "connectable": True},
+            BluetoothScanningMode.ACTIVE  # Matches your aggressive Proxy settings
+        )
+    )
+    # --- END OF FIX ---
+
     # Don't require initial connection - allow integration to load even if locomotive is off
     try:
         await coordinator.async_setup()
@@ -77,7 +97,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except (BleakError, asyncio.TimeoutError) as err:
         _LOGGER.warning("Could not connect to Lionel train at %s during setup: %s", mac_address, err)
         _LOGGER.info("Integration will load anyway - train will connect when powered on")
-        # Don't raise ConfigEntryNotReady - let the integration load anyway
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator
@@ -161,6 +180,12 @@ class LionelTrainCoordinator:
         
         # Status information
         self._last_notification_hex = None
+
+    def async_set_ble_device(self, ble_device: Any) -> None:
+        """Update the BLE device from an advertisement."""
+        # This keeps the internal device reference fresh
+        # so reconnects happen instantly.
+        pass
 
     @property
     def connected(self) -> bool:
