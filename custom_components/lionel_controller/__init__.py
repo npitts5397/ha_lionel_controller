@@ -84,7 +84,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         bluetooth.async_register_callback(
             hass,
             _async_update_ble,
-            {"address": mac_address, "connectable": True},
+            {"address": mac_address},
             BluetoothScanningMode.ACTIVE  # Matches your aggressive Proxy settings
         )
     )
@@ -183,9 +183,14 @@ class LionelTrainCoordinator:
 
     def async_set_ble_device(self, ble_device: Any) -> None:
         """Update the BLE device from an advertisement."""
-        # This keeps the internal device reference fresh
-        # so reconnects happen instantly.
-        pass
+        # 1. Update the internal reference (optional, but good practice)
+        # self._ble_device = ble_device 
+
+        # 2. THE FIX: If we see the train and we aren't connected, CONNECT!
+        if not self.connected and not self._lock.locked():
+            _LOGGER.debug("🚂 Train found! Attempting auto-reconnect...")
+            # We must schedule this because we are inside a callback
+            self.hass.async_create_task(self._async_connect())
 
     @property
     def connected(self) -> bool:
