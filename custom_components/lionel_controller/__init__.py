@@ -8,7 +8,7 @@ from typing import Any
 from bleak import BleakClient, BleakError
 from bleak_retry_connector import establish_connection, BleakClientWithServiceCache
 from homeassistant.components import bluetooth
-from homeassistant.components.bluetooth import BluetoothServiceInfoBleak, BluetoothChange
+from homeassistant.components.bluetooth import BluetoothServiceInfoBleak, BluetoothChange, BluetoothScanningMode, async_register_callback
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_NAME, Platform
 from homeassistant.core import HomeAssistant, callback
