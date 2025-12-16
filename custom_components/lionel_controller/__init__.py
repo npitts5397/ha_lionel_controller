@@ -65,7 +65,6 @@ def _async_discovered_device(
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Lionel Train Controller from a config entry."""
     # CRITICAL FIX 1: Normalize MAC to uppercase to ensure the listener filter matches
-    # If the config entry has lowercase but HA sees uppercase, the listener silently fails.
     mac_address = entry.data[CONF_MAC_ADDRESS].upper()
     name = entry.data[CONF_NAME]
     service_uuid = entry.data[CONF_SERVICE_UUID]
@@ -76,7 +75,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     @callback
     def _async_update_ble(service_info: BluetoothServiceInfoBleak, change: BluetoothChange):
         """Update from a Bluetooth advertisement."""
-        # Pass the whole service_info object so we can use the fresh device
         coordinator.async_set_ble_device(service_info)
 
     # Tell Home Assistant to listen for this device forever
@@ -92,7 +90,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # --- WATCHDOG & BOOT LOGIC ---
     
     # 1. Boot Retry: Retry connection once Home Assistant has fully started.
-    # This catches cases where the Proxy wasn't ready during initial load.
     async def _on_hass_start(event):
         if not coordinator.connected:
             _LOGGER.debug("HA Started: Attempting delayed connection to Lionel Train")
@@ -105,9 +102,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # 2. Watchdog: A safety net that checks every 30s if the listener missed something.
     async def _async_watchdog(now):
         if not coordinator.connected:
-            _LOGGER.debug("🐕 Watchdog: Train disconnected. Triggering scan/connect check.")
             # Pass None to force a cache lookup since we don't have a fresh packet here
-            hass.async_create_task(coordinator._async_connect(None))
+            # Use the PUBLIC method (async_connect) which handles locking safely
+            hass.async_create_task(coordinator.async_connect(None))
         
         # Reschedule self for 30 seconds later
         coordinator._watchdog_unsub = async_call_later(hass, 30.0, _async_watchdog)
@@ -124,8 +121,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await coordinator.async_setup()
         _LOGGER.info("Successfully connected to Lionel train at %s", mac_address)
     except (BleakError, asyncio.TimeoutError) as err:
-        _LOGGER.warning("Could not connect to Lionel train at %s during setup: %s", mac_address, err)
-        _LOGGER.info("Integration will load anyway - train will connect when powered on")
+        _LOGGER.debug("Initial connection failed: %s", err)
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator
@@ -229,15 +225,13 @@ class LionelTrainCoordinator:
         # 1. Update internal reference using the fresh advertisement
         self._client_ble_device = service_info.device
 
-        # 2. Check for State Desync (The "Reload Required" Fix)
-        # If Logic says connected, but Client says disconnected -> Reset.
+        # 2. Check for State Desync (Logic says connected, Client says disconnected)
         if self._connected and (self._client is None or not self._client.is_connected):
             _LOGGER.debug("🚂 State Desync: Logic says connected, Client says disconnected. Resetting.")
             self._connected = False
 
         # 3. Aggressive Ghost Check
         # If we see ANY advertisement while we think we are connected, force reset.
-        # This handles the case where HA thinks it's connected but the train rebooted.
         if self._connected:
             _LOGGER.debug("🚂 Advertisement received while connected -> Ghost Connection detected. Resetting.")
             self._connected = False
@@ -251,8 +245,8 @@ class LionelTrainCoordinator:
                 self._last_reconnect_attempt = now
                 
                 _LOGGER.debug("🚂 Train found! Attempting auto-reconnect using fresh advertisement...")
-                # Pass the fresh device explicitly to the connect method
-                self.hass.async_create_task(self._async_connect(service_info.device))
+                # Call the PUBLIC method which handles the lock
+                self.hass.async_create_task(self.async_connect(service_info.device))
 
     @property
     def connected(self) -> bool:
@@ -265,6 +259,7 @@ class LionelTrainCoordinator:
         self._connected = False
         self._notify_state_change()
 
+    # --- Properties ---
     @property
     def speed(self) -> int:
         """Return current speed (0-100)."""
@@ -355,12 +350,11 @@ class LionelTrainCoordinator:
 
     async def async_setup(self) -> None:
         """Set up the coordinator."""
+        # Use the public method to ensure locks are handled
         try:
-            await self._async_connect()
+            await self.async_connect()
         except (BleakError, asyncio.TimeoutError) as err:
             _LOGGER.debug("Initial connection failed during setup: %s", err)
-            # Don't raise - let the integration load anyway
-            # Connection will be attempted when entities try to communicate
 
     async def async_shutdown(self) -> None:
         """Shut down the coordinator."""
@@ -369,68 +363,73 @@ class LionelTrainCoordinator:
             await self._client.disconnect()
         self._connected = False
 
-    async def _async_connect(self, specific_ble_device=None) -> None:
-        """Connect to the train."""
+    # --- DEADLOCK FIX: Split Connection Logic ---
+
+    async def async_connect(self, specific_ble_device=None) -> None:
+        """Public method to connect. Acquires lock, then calls internal logic."""
         async with self._lock:
-            if self._connected:
-                return
+            await self._connect_internal(specific_ble_device)
 
-            # OPTION A: Use the specific fresh device passed from the advertisement
-            ble_device = specific_ble_device
+    async def _connect_internal(self, specific_ble_device=None) -> None:
+        """Internal connection logic. ASSUMES LOCK IS ALREADY HELD."""
+        if self._connected:
+            return
 
-            # OPTION B: Use our internal fresh cache if Option A is missing
-            if not ble_device:
-                 ble_device = self._client_ble_device
+        # OPTION A: Use the specific fresh device passed from the advertisement
+        ble_device = specific_ble_device
 
-            # OPTION C: Fallback to HA Cache (connectable=False for safety)
-            if not ble_device:
-                _LOGGER.debug("No fresh device found, checking HA cache...")
-                ble_device = bluetooth.async_ble_device_from_address(
-                    self.hass, self.mac_address, connectable=False
-                )
+        # OPTION B: Use our internal fresh cache if Option A is missing
+        if not ble_device:
+             ble_device = self._client_ble_device
+
+        # OPTION C: Fallback to HA Cache (connectable=False for safety)
+        if not ble_device:
+            _LOGGER.debug("No fresh device found, checking HA cache...")
+            ble_device = bluetooth.async_ble_device_from_address(
+                self.hass, self.mac_address, connectable=False
+            )
+        
+        if not ble_device:
+            raise BleakError(f"Could not find Bluetooth device with address {self.mac_address}")
+
+        try:
+            _LOGGER.debug("Establishing connection to %s", self.mac_address)
+            self._client = await establish_connection(
+                BleakClientWithServiceCache,
+                ble_device,
+                self.mac_address,
+                max_attempts=3,
+                disconnected_callback=self._on_disconnected,
+            )
             
-            if not ble_device:
-                raise BleakError(f"Could not find Bluetooth device with address {self.mac_address}")
-
+            # Read device information if available
+            await self._read_device_info()
+            
+            # Log all BLE services and characteristics for debugging
+            await self._log_ble_characteristics()
+            
+            # Set up notification handler for status updates
             try:
-                _LOGGER.debug("Establishing connection to %s", self.mac_address)
-                self._client = await establish_connection(
-                    BleakClientWithServiceCache,
-                    ble_device,
-                    self.mac_address,
-                    max_attempts=3,
-                    disconnected_callback=self._on_disconnected,
+                # Always use the known-good notify characteristic UUID
+                notify_char_uuid = NOTIFY_CHARACTERISTIC_UUID
+                await self._client.start_notify(
+                    notify_char_uuid, self._notification_handler
                 )
-                
-                # Read device information if available
-                await self._read_device_info()
-                
-                # Log all BLE services and characteristics for debugging
-                await self._log_ble_characteristics()
-                
-                # Set up notification handler for status updates
-                try:
-                    # Always use the known-good notify characteristic UUID
-                    notify_char_uuid = NOTIFY_CHARACTERISTIC_UUID
-                    await self._client.start_notify(
-                        notify_char_uuid, self._notification_handler
-                    )
-                    _LOGGER.info("📡 Set up notifications on %s", notify_char_uuid)
-                except BleakError as err:
-                    _LOGGER.debug("Could not set up notifications (train may not support them): %s", err)
-                
-                self._connected = True
-                self._retry_count = 0
-                _LOGGER.info("Successfully reconnected to train")
-                
-                # Notify all entities of the reconnection
-                self._notify_state_change()
-                return True
-
+                _LOGGER.info("📡 Set up notifications on %s", notify_char_uuid)
             except BleakError as err:
-                _LOGGER.error("Failed to connect to train: %s", err)
-                self._connected = False
-                raise
+                _LOGGER.debug("Could not set up notifications (train may not support them): %s", err)
+            
+            self._connected = True
+            self._retry_count = 0
+            _LOGGER.info("Successfully reconnected to train")
+            
+            # Notify all entities of the reconnection
+            self._notify_state_change()
+
+        except BleakError as err:
+            _LOGGER.error("Failed to connect to train: %s", err)
+            self._connected = False
+            raise
 
     async def _notification_handler(self, sender: int, data: bytearray) -> None:
         """Handle notifications from the train."""
@@ -596,10 +595,10 @@ class LionelTrainCoordinator:
     async def async_send_command(self, command_data: list[int]) -> bool:
         """Send a command to the train."""
         async with self._lock:
-            # Try to connect if not connected
+            # DEADLOCK FIX: If not connected, call INTERNAL method (which does NOT try to grab the lock again)
             if not self.connected:
                 try:
-                    await self._async_connect()
+                    await self._connect_internal()
                 except BleakError as err:
                     _LOGGER.error("Failed to connect before sending command: %s", err)
                     return False
@@ -633,7 +632,8 @@ class LionelTrainCoordinator:
                     if attempt < max_retries - 1:
                         try:
                             await asyncio.sleep(0.5 * (attempt + 1))  # Exponential backoff
-                            await self._async_connect()
+                            # Call internal connect to avoid deadlock
+                            await self._connect_internal()
                         except BleakError:
                             _LOGGER.debug("Reconnection attempt %d failed", attempt + 1)
                             continue
@@ -722,28 +722,8 @@ class LionelTrainCoordinator:
         await asyncio.sleep(1.0)
         
         # Now try to establish a fresh connection
-        max_attempts = 5
-        for attempt in range(max_attempts):
-            try:
-                _LOGGER.debug("Connection attempt %d/%d", attempt + 1, max_attempts)
-                
-                # Try to connect using whatever mechanism _async_connect prefers
-                await self._async_connect()
-                
-                if self.connected:
-                    return True
-                
-            except BleakError as err:
-                _LOGGER.debug("Connection attempt %d failed: %s", attempt + 1, err)
-                if attempt < max_attempts - 1:
-                    wait_time = (attempt + 1) * 1.0  # 1s, 2s, 3s, 4s delays
-                    _LOGGER.debug("Waiting %s seconds before retry", wait_time)
-                    await asyncio.sleep(wait_time)
-                else:
-                    _LOGGER.error("Failed to reconnect after %d attempts: %s", max_attempts, err)
-                    return False
-                    
-        return False
+        # Use public method to handle locks
+        return await self.async_connect()
 
     # Advanced feature control methods
     async def async_set_master_volume(self, volume: int) -> bool:
