@@ -10,8 +10,9 @@ from bleak_retry_connector import establish_connection, BleakClientWithServiceCa
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import BluetoothServiceInfoBleak, BluetoothChange, BluetoothScanningMode, async_register_callback
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_NAME, Platform
+from homeassistant.const import CONF_NAME, Platform, EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.event import async_call_later
 from homeassistant.exceptions import ConfigEntryNotReady
 
 from .const import (
@@ -63,17 +64,19 @@ def _async_discovered_device(
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Lionel Train Controller from a config entry."""
-    mac_address = entry.data[CONF_MAC_ADDRESS]
+    # CRITICAL FIX 1: Normalize MAC to uppercase to ensure the listener filter matches
+    # If the config entry has lowercase but HA sees uppercase, the listener silently fails.
+    mac_address = entry.data[CONF_MAC_ADDRESS].upper()
     name = entry.data[CONF_NAME]
     service_uuid = entry.data[CONF_SERVICE_UUID]
 
     coordinator = LionelTrainCoordinator(hass, mac_address, name, service_uuid)
     
-    # --- START OF FIX: THE LISTENER ---
+    # --- LISTENER ---
     @callback
     def _async_update_ble(service_info: BluetoothServiceInfoBleak, change: BluetoothChange):
         """Update from a Bluetooth advertisement."""
-        # Pass the WHOLE info object so we can use the fresh device
+        # Pass the whole service_info object so we can use the fresh device
         coordinator.async_set_ble_device(service_info)
 
     # Tell Home Assistant to listen for this device forever
@@ -85,8 +88,37 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             BluetoothScanningMode.ACTIVE  # Matches your aggressive Proxy settings
         )
     )
-    # --- END OF FIX ---
 
+    # --- WATCHDOG & BOOT LOGIC ---
+    
+    # 1. Boot Retry: Retry connection once Home Assistant has fully started.
+    # This catches cases where the Proxy wasn't ready during initial load.
+    async def _on_hass_start(event):
+        if not coordinator.connected:
+            _LOGGER.debug("HA Started: Attempting delayed connection to Lionel Train")
+            await coordinator.async_setup()
+
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _on_hass_start)
+    )
+
+    # 2. Watchdog: A safety net that checks every 30s if the listener missed something.
+    async def _async_watchdog(now):
+        if not coordinator.connected:
+            _LOGGER.debug("🐕 Watchdog: Train disconnected. Triggering scan/connect check.")
+            # Pass None to force a cache lookup since we don't have a fresh packet here
+            hass.async_create_task(coordinator._async_connect(None))
+        
+        # Reschedule self for 30 seconds later
+        coordinator._watchdog_unsub = async_call_later(hass, 30.0, _async_watchdog)
+
+    # Start the watchdog
+    coordinator._watchdog_unsub = async_call_later(hass, 30.0, _async_watchdog)
+    
+    # Ensure watchdog stops on unload
+    entry.async_on_unload(lambda: coordinator.cancel_watchdog())
+
+    # --- INITIAL SETUP ---
     # Don't require initial connection - allow integration to load even if locomotive is off
     try:
         await coordinator.async_setup()
@@ -141,10 +173,13 @@ class LionelTrainCoordinator:
         self._lock = asyncio.Lock()
         self._retry_count = 0
         self._update_callbacks = set()
-        self._last_reconnect_attempt = 0.0
         
-        # Internal reference to the latest BLE device object
+        # Initialize to negative so throttle doesn't block immediately on fresh boot
+        self._last_reconnect_attempt = -100.0
+        
+        # Internal references
         self._client_ble_device = None
+        self._watchdog_unsub = None
         
         # State tracking
         self._speed = 0
@@ -182,21 +217,32 @@ class LionelTrainCoordinator:
         # Status information
         self._last_notification_hex = None
 
+    def cancel_watchdog(self):
+        """Stop the background watchdog timer."""
+        if self._watchdog_unsub:
+            self._watchdog_unsub()
+            self._watchdog_unsub = None
+
     def async_set_ble_device(self, service_info: BluetoothServiceInfoBleak) -> None:
         """Update the BLE device from an advertisement."""
         
-        # 1. Capture the FRESH device object directly from the packet.
+        # 1. Update internal reference using the fresh advertisement
         self._client_ble_device = service_info.device
 
-        # 2. THE FIX for "Stuck Flag":
-        # Your entities are unavailable (client is dead), but self._connected is stuck True.
-        # Since Lionel trains DON'T advertise when connected, seeing an advertisement
-        # proves we are disconnected. We force the flag to False to unblock _async_connect.
-        if self._connected:
-            _LOGGER.debug("🚂 Advertisement received while internal flag was True. forcing disconnect state.")
+        # 2. Check for State Desync (The "Reload Required" Fix)
+        # If Logic says connected, but Client says disconnected -> Reset.
+        if self._connected and (self._client is None or not self._client.is_connected):
+            _LOGGER.debug("🚂 State Desync: Logic says connected, Client says disconnected. Resetting.")
             self._connected = False
-            
-        # 3. Connect if needed (Logic: Disconnected + Unlocked + Throttled)
+
+        # 3. Aggressive Ghost Check
+        # If we see ANY advertisement while we think we are connected, force reset.
+        # This handles the case where HA thinks it's connected but the train rebooted.
+        if self._connected:
+            _LOGGER.debug("🚂 Advertisement received while connected -> Ghost Connection detected. Resetting.")
+            self._connected = False
+
+        # 4. Connect if needed (Logic: Disconnected + Unlocked + Throttled)
         if not self.connected and not self._lock.locked():
             
             # THROTTLE: Check if it has been 5 seconds since the last try
@@ -318,6 +364,7 @@ class LionelTrainCoordinator:
 
     async def async_shutdown(self) -> None:
         """Shut down the coordinator."""
+        self.cancel_watchdog()  # Ensure timer stops
         if self._client and self._client.is_connected:
             await self._client.disconnect()
         self._connected = False
