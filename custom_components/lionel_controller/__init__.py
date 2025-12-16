@@ -386,7 +386,7 @@ class LionelTrainCoordinator:
         if not ble_device:
             _LOGGER.debug("No fresh device found, checking HA cache...")
             ble_device = bluetooth.async_ble_device_from_address(
-                self.hass, self.mac_address, connectable=False
+                self.hass, self.mac_address, connectable=True
             )
         
         if not ble_device:
