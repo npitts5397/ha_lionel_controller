@@ -144,6 +144,7 @@ class LionelTrainCoordinator:
         self._lock = asyncio.Lock()
         self._retry_count = 0
         self._update_callbacks = set()
+        self._last_reconnect_attempt = 0.0
         
         # State tracking
         self._speed = 0
@@ -183,14 +184,23 @@ class LionelTrainCoordinator:
 
     def async_set_ble_device(self, ble_device: Any) -> None:
         """Update the BLE device from an advertisement."""
-        # 1. Update the internal reference (optional, but good practice)
-        # self._ble_device = ble_device 
+        # 1. Update the internal reference to keep the object fresh
+        # (The library uses this to connect, so it's good to have)
+        self._client_ble_device = ble_device
 
-        # 2. THE FIX: If we see the train and we aren't connected, CONNECT!
+        # 2. The Logic: Only attempt if disconnected, unlocked, AND throttled
         if not self.connected and not self._lock.locked():
-            _LOGGER.debug("🚂 Train found! Attempting auto-reconnect...")
-            # We must schedule this because we are inside a callback
-            self.hass.async_create_task(self._async_connect())
+            
+            # THROTTLE: Check if it has been 5 seconds since the last try
+            now = self.hass.loop.time()
+            if now - self._last_reconnect_attempt > 5.0:
+                self._last_reconnect_attempt = now
+                
+                _LOGGER.debug("🚂 Train found! Attempting auto-reconnect...")
+                self.hass.async_create_task(self._async_connect())
+            
+            # If it hasn't been 5 seconds, we do NOTHING. 
+            # This ignores the other 49 rapid-fire advertisements.
 
     @property
     def connected(self) -> bool:
