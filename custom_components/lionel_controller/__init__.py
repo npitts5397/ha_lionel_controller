@@ -207,6 +207,12 @@ class LionelTrainCoordinator:
         """Return True if connected to the train."""
         return self._connected and self._client is not None and self._client.is_connected
 
+    def _on_disconnected(self, client: BleakClientWithServiceCache) -> None:
+        """Handle disconnection event."""
+        _LOGGER.warning("🚂 Disconnected from Lionel train!")
+        self._connected = False
+        self._notify_state_change()
+
     @property
     def speed(self) -> int:
         """Return current speed (0-100)."""
@@ -318,7 +324,7 @@ class LionelTrainCoordinator:
 
             # Get a fresh BLE device reference
             ble_device = bluetooth.async_ble_device_from_address(
-                self.hass, self.mac_address, connectable=True
+                self.hass, self.mac_address, connectable=False
             )
             
             if not ble_device:
@@ -339,6 +345,7 @@ class LionelTrainCoordinator:
                     ble_device,
                     self.mac_address,
                     max_attempts=3,
+                    disconnected_callback=self._on_disconnected,
                 )
                 
                 # Read device information if available
