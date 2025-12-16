@@ -185,22 +185,18 @@ class LionelTrainCoordinator:
     def async_set_ble_device(self, service_info: BluetoothServiceInfoBleak) -> None:
         """Update the BLE device from an advertisement."""
         
-        # 1. Update the internal reference using the fresh advertisement
+        # 1. Capture the FRESH device object directly from the packet.
         self._client_ble_device = service_info.device
 
-        # 2. Check for State Desync (The "Reload Required" Fix)
-        # If Logic says connected, but Client says disconnected -> Reset.
-        if self._connected and (self._client is None or not self._client.is_connected):
-            _LOGGER.debug("🚂 State Desync: Logic says connected, Client says disconnected. Resetting.")
+        # 2. THE FIX for "Stuck Flag":
+        # Your entities are unavailable (client is dead), but self._connected is stuck True.
+        # Since Lionel trains DON'T advertise when connected, seeing an advertisement
+        # proves we are disconnected. We force the flag to False to unblock _async_connect.
+        if self._connected:
+            _LOGGER.debug("🚂 Advertisement received while internal flag was True. forcing disconnect state.")
             self._connected = False
-
-        # 3. Check for Ghost Connection
-        # If train says "I'm connectable" but we think we are connected -> Reset.
-        if self._connected and service_info.connectable:
-            _LOGGER.debug("🚂 Ghost Connection: Train advertised connectable while we marked connected. Resetting.")
-            self._connected = False
-
-        # 4. Connect if needed (Logic: Disconnected + Unlocked + Throttled)
+            
+        # 3. Connect if needed (Logic: Disconnected + Unlocked + Throttled)
         if not self.connected and not self._lock.locked():
             
             # THROTTLE: Check if it has been 5 seconds since the last try
