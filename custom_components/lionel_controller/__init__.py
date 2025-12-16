@@ -73,7 +73,6 @@ def _async_discovered_device(
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Lionel Train Controller from a config entry."""
-    # Normalize MAC for consistent address matching
     mac_address = entry.data[CONF_MAC_ADDRESS].upper()
     name = entry.data[CONF_NAME]
     service_uuid = entry.data[CONF_SERVICE_UUID]
@@ -97,7 +96,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
     )
 
-    # Initial setup: do not fail the entry if train is off
+    # Initial setup: allow load even if locomotive is off
     try:
         await coordinator.async_setup()
         _LOGGER.info("Successfully connected to Lionel train at %s", mac_address)
@@ -113,7 +112,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await hass.config_entries.async_reload(entry.entry_id)
 
     if not hass.services.has_service(DOMAIN, "reload_integration"):
-        hass.services.async_register(DOMAIN, "reload_integration", reload_integration_service)
+        hass.services.async_register(
+            DOMAIN, "reload_integration", reload_integration_service
+        )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
@@ -150,10 +151,10 @@ class LionelTrainCoordinator:
         self._retry_count = 0
         self._update_callbacks: set[callable] = set()
 
-        # Start very negative so first reconnect isn't throttled
+        # Start negative so first reconnect isn't throttled
         self._last_reconnect_attempt = -100.0
 
-        # BLE device cache from latest advertisement
+        # BLE device cache from latest advertisement (debug/awareness only)
         self._client_ble_device = None
 
         # State tracking
@@ -205,49 +206,47 @@ class LionelTrainCoordinator:
         if change != BluetoothChange.ADVERTISEMENT:
             return
 
-        # Cache the most recent BLEDevice
+        # Cache the most recent BLEDevice (for debugging, not direct use)
         self._client_ble_device = service_info.device
 
-        # If we think we're connected, but client isn't, fix state
+        # Fix obvious desync: we think connected, but client isn't
         if self._connected and (self._client is None or not self._client.is_connected):
             _LOGGER.debug(
-                "State desync detected: _connected=True but client is not connected. Resetting state."
+                "State desync: _connected=True but client is not connected. Resetting state."
             )
             self._connected = False
 
-        # If we receive a connectable advertisement while we think we're connected,
-        # and the client disagrees, treat this as a ghost and reset.
-        if (
-            self._connected
-            and service_info.connectable
-            and (self._client is None or not self._client.is_connected)
-        ):
-            _LOGGER.debug(
-                "Connectable advertisement while client not connected -> ghost connection. Resetting."
-            )
-            self._connected = False
-
-        # If already connected and client agrees, do nothing.
+        # If already connected and client agrees, do nothing
         if self.connected:
             return
 
         # Throttle reconnect attempts
         if self._lock.locked():
+            _LOGGER.debug("Reconnect attempt skipped: lock is held.")
             return
 
         now = self.hass.loop.time()
         if now - self._last_reconnect_attempt < 5.0:
+            _LOGGER.debug("Reconnect attempt skipped: throttled.")
             return
 
         self._last_reconnect_attempt = now
 
-        # Only try auto-reconnect when the advertisement says we are connectable
+        # We still prefer to see connectable=True, but we won't *use* this device directly.
         if service_info.connectable:
             _LOGGER.debug(
-                "Connectable advertisement received for %s. Attempting auto-reconnect...",
+                "Advertisement trigger for %s (connectable=%s). Scheduling auto-reconnect...",
+                self.mac_address,
+                service_info.connectable,
+            )
+        else:
+            _LOGGER.debug(
+                "Advertisement for %s is not marked connectable. Still scheduling reconnect based on HA cache.",
                 self.mac_address,
             )
-            self.hass.async_create_task(self.async_connect(service_info.device))
+
+        # Critical change: do NOT pass service_info.device; let async_connect use HA resolver.
+        self.hass.async_create_task(self.async_connect())
 
     # -------------------------------------------------------------------------
     # Connection state and helpers
@@ -281,45 +280,40 @@ class LionelTrainCoordinator:
             await self._client.disconnect()
         self._connected = False
 
-    async def async_connect(self, specific_ble_device=None) -> None:
+    async def async_connect(self) -> None:
         """Public method to connect. Acquires lock, then calls internal logic."""
         async with self._lock:
-            await self._connect_internal(specific_ble_device)
+            await self._connect_internal()
 
-    async def _connect_internal(self, specific_ble_device=None) -> None:
+    async def _connect_internal(self) -> None:
         """Internal connection logic. ASSUMES LOCK IS ALREADY HELD."""
         if self.connected:
+            _LOGGER.debug("Connect requested but already connected; skipping.")
             return
 
-        # Preferred: specific BLEDevice from fresh advertisement
-        ble_device = specific_ble_device
+        # Always resolve via HA's connectable cache; this is what works on reload.
+        _LOGGER.debug(
+            "Querying Home Assistant for connectable BLEDevice for %s", self.mac_address
+        )
+        ble_device = bluetooth.async_ble_device_from_address(
+            self.hass,
+            self.mac_address,
+            connectable=True,  # critical: must be True to avoid stale devices
+        )
 
-        # Next: last cached BLEDevice from advertisement callback
-        if ble_device is None:
-            ble_device = self._client_ble_device
-
-        # If we have a device but it is not connectable, treat it as stale
-        if ble_device is not None and not getattr(ble_device, "connectable", False):
-            _LOGGER.debug(
-                "Ignoring non-connectable BLEDevice from cache (likely stale proxy entry)."
-            )
-            ble_device = None
-
-        # Fallback: ask HA for a fresh, connectable BLEDevice
         if ble_device is None:
             _LOGGER.debug(
-                "No fresh BLEDevice available, querying HA for connectable device..."
+                "No connectable BLEDevice found in HA cache for %s", self.mac_address
             )
-            ble_device = bluetooth.async_ble_device_from_address(
-                self.hass,
-                self.mac_address,
-                connectable=True,  # critical: must be True to avoid stale devices
-            )
-
-        if ble_device is None:
             raise BleakError(
                 f"Could not find connectable Bluetooth device with address {self.mac_address}"
             )
+
+        _LOGGER.debug(
+            "Using BLEDevice from HA cache: address=%s connectable=%s",
+            getattr(ble_device, "address", None),
+            getattr(ble_device, "connectable", None),
+        )
 
         try:
             _LOGGER.debug("Establishing connection to %s", self.mac_address)
@@ -368,14 +362,11 @@ class LionelTrainCoordinator:
         """Handle notifications from the train."""
         _LOGGER.debug("Received notification: %s", data.hex())
 
-        # Store the raw notification hex string
         self._last_notification_hex = data.hex()
 
-        # Parse locomotive status data based on protocol analysis
         if len(data) >= 8 and data[0] == 0x00 and data[1] == 0x81 and data[2] == 0x02:
-            # [0x00, 0x81, 0x02, speed, direction, 0x03, 0x0C, flags]
             try:
-                self._speed = int((data[3] / 31) * 100)  # 0–31 -> 0–100%
+                self._speed = int((data[3] / 31) * 100)
                 self._direction_forward = data[4] == 0x01
 
                 flags = data[7]
@@ -395,7 +386,6 @@ class LionelTrainCoordinator:
             except (IndexError, ValueError) as err:
                 _LOGGER.debug("Error parsing train status: %s", err)
         else:
-            # For any notification, notify state change to update hex sensor
             self._notify_state_change()
 
     # -------------------------------------------------------------------------
@@ -449,8 +439,8 @@ class LionelTrainCoordinator:
                 is_potential_lionchief = (
                     str(service.uuid).lower()
                     not in [
-                        "0000180a-0000-1000-8000-00805f9b34fb",  # Device Information
-                        "0000180f-0000-1000-8000-00805f9b34fb",  # Battery Service
+                        "0000180a-0000-1000-8000-00805f9b34fb",  # Device Info
+                        "0000180f-0000-1000-8000-00805f9b34fb",  # Battery
                         "00001800-0000-1000-8000-00805f9b34fb",  # Generic Access
                         "00001801-0000-1000-8000-00805f9b34fb",  # Generic Attribute
                     ]
@@ -515,7 +505,7 @@ class LionelTrainCoordinator:
                                 _LOGGER.debug(
                                     "    Value: <large data, %d bytes>", len(value)
                                 )
-                        except Exception as err:  # noqa: BLE001
+                        except Exception as err:
                             _LOGGER.debug("    Could not read value: %s", err)
 
                 _LOGGER.debug("  Found %d characteristics in this service", char_count)
@@ -538,24 +528,7 @@ class LionelTrainCoordinator:
                     self._discovered_notify_char,
                 )
 
-            if (
-                self._discovered_write_char
-                and self._discovered_write_char != WRITE_CHARACTERISTIC_UUID
-            ):
-                _LOGGER.info(
-                    "💡 Consider updating WRITE_CHARACTERISTIC_UUID to: %s",
-                    self._discovered_write_char,
-                )
-            if (
-                self._discovered_notify_char
-                and self._discovered_notify_char != NOTIFY_CHARACTERISTIC_UUID
-            ):
-                _LOGGER.info(
-                    "💡 Consider updating NOTIFY_CHARACTERISTIC_UUID to: %s",
-                    self._discovered_notify_char,
-                )
-
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             _LOGGER.error("Error during BLE service discovery: %s", err)
             import traceback
 
@@ -576,8 +549,8 @@ class LionelTrainCoordinator:
                     return False
 
             write_char_uuid = WRITE_CHARACTERISTIC_UUID
-
             max_retries = 3
+
             for attempt in range(max_retries):
                 try:
                     await self._client.write_gatt_char(
@@ -695,7 +668,7 @@ class LionelTrainCoordinator:
                 if self._client.is_connected:
                     await self._client.disconnect()
                     _LOGGER.debug("Disconnected existing client")
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
                 _LOGGER.debug(
                     "Error disconnecting client (expected if already disconnected): %s",
                     err,
@@ -804,7 +777,7 @@ class LionelTrainCoordinator:
         for callback in list(self._update_callbacks):
             try:
                 callback()
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
                 _LOGGER.error("Error calling update callback: %s", err)
 
     # -------------------------------------------------------------------------
