@@ -73,11 +73,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     @callback
     def _async_update_ble(service_info: BluetoothServiceInfoBleak, change: BluetoothChange):
         """Update from a Bluetooth advertisement."""
-        # This function runs every time your Proxy hears the train.
-        # It ensures Home Assistant keeps the device 'fresh' in the cache.
-        # If you wanted to auto-reconnect immediately upon seeing the train,
-        # you would trigger that logic here.
-        coordinator.async_set_ble_device(service_info.device)
+        coordinator.async_set_ble_device(service_info)
 
     # Tell Home Assistant to listen for this device forever
     entry.async_on_unload(
@@ -182,13 +178,19 @@ class LionelTrainCoordinator:
         # Status information
         self._last_notification_hex = None
 
-    def async_set_ble_device(self, ble_device: Any) -> None:
+    def async_set_ble_device(self, service_info: BluetoothServiceInfoBleak) -> None:
         """Update the BLE device from an advertisement."""
-        # 1. Update the internal reference to keep the object fresh
-        # (The library uses this to connect, so it's good to have)
-        self._client_ble_device = ble_device
+        # Update the internal reference
+        self._client_ble_device = service_info.device
 
-        # 2. The Logic: Only attempt if disconnected, unlocked, AND throttled
+        # GHOST CONNECTION FIX:
+        # If the train is broadcasting "I'm connectable!", but HA thinks 
+        # we are already connected, HA is wrong. Force a disconnect state.
+        if self.connected and service_info.connectable:
+            _LOGGER.debug("🚂 Detected connectable advertisement while marked connected. Assuming ghost connection.")
+            self._connected = False
+
+        # The Logic: Only attempt if disconnected, unlocked, AND throttled
         if not self.connected and not self._lock.locked():
             
             # THROTTLE: Check if it has been 5 seconds since the last try
@@ -198,9 +200,6 @@ class LionelTrainCoordinator:
                 
                 _LOGGER.debug("🚂 Train found! Attempting auto-reconnect...")
                 self.hass.async_create_task(self._async_connect())
-            
-            # If it hasn't been 5 seconds, we do NOTHING. 
-            # This ignores the other 49 rapid-fire advertisements.
 
     @property
     def connected(self) -> bool:
