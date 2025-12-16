@@ -73,6 +73,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     @callback
     def _async_update_ble(service_info: BluetoothServiceInfoBleak, change: BluetoothChange):
         """Update from a Bluetooth advertisement."""
+        # Pass the WHOLE info object so we can use the fresh device
         coordinator.async_set_ble_device(service_info)
 
     # Tell Home Assistant to listen for this device forever
@@ -142,6 +143,9 @@ class LionelTrainCoordinator:
         self._update_callbacks = set()
         self._last_reconnect_attempt = 0.0
         
+        # Internal reference to the latest BLE device object
+        self._client_ble_device = None
+        
         # State tracking
         self._speed = 0
         self._direction_forward = True
@@ -180,17 +184,23 @@ class LionelTrainCoordinator:
 
     def async_set_ble_device(self, service_info: BluetoothServiceInfoBleak) -> None:
         """Update the BLE device from an advertisement."""
-        # Update the internal reference
+        
+        # 1. Update the internal reference using the fresh advertisement
         self._client_ble_device = service_info.device
 
-        # GHOST CONNECTION FIX:
-        # If the train is broadcasting "I'm connectable!", but HA thinks 
-        # we are already connected, HA is wrong. Force a disconnect state.
-        if self.connected and service_info.connectable:
-            _LOGGER.debug("🚂 Detected connectable advertisement while marked connected. Assuming ghost connection.")
+        # 2. Check for State Desync (The "Reload Required" Fix)
+        # If Logic says connected, but Client says disconnected -> Reset.
+        if self._connected and (self._client is None or not self._client.is_connected):
+            _LOGGER.debug("🚂 State Desync: Logic says connected, Client says disconnected. Resetting.")
             self._connected = False
 
-        # The Logic: Only attempt if disconnected, unlocked, AND throttled
+        # 3. Check for Ghost Connection
+        # If train says "I'm connectable" but we think we are connected -> Reset.
+        if self._connected and service_info.connectable:
+            _LOGGER.debug("🚂 Ghost Connection: Train advertised connectable while we marked connected. Resetting.")
+            self._connected = False
+
+        # 4. Connect if needed (Logic: Disconnected + Unlocked + Throttled)
         if not self.connected and not self._lock.locked():
             
             # THROTTLE: Check if it has been 5 seconds since the last try
@@ -198,8 +208,9 @@ class LionelTrainCoordinator:
             if now - self._last_reconnect_attempt > 5.0:
                 self._last_reconnect_attempt = now
                 
-                _LOGGER.debug("🚂 Train found! Attempting auto-reconnect...")
-                self.hass.async_create_task(self._async_connect())
+                _LOGGER.debug("🚂 Train found! Attempting auto-reconnect using fresh advertisement...")
+                # Pass the fresh device explicitly to the connect method
+                self.hass.async_create_task(self._async_connect(service_info.device))
 
     @property
     def connected(self) -> bool:
@@ -315,25 +326,26 @@ class LionelTrainCoordinator:
             await self._client.disconnect()
         self._connected = False
 
-    async def _async_connect(self) -> None:
+    async def _async_connect(self, specific_ble_device=None) -> None:
         """Connect to the train."""
         async with self._lock:
             if self._connected:
                 return
 
-            # Get a fresh BLE device reference
-            ble_device = bluetooth.async_ble_device_from_address(
-                self.hass, self.mac_address, connectable=False
-            )
-            
+            # OPTION A: Use the specific fresh device passed from the advertisement
+            ble_device = specific_ble_device
+
+            # OPTION B: Use our internal fresh cache if Option A is missing
             if not ble_device:
-                # Try to scan for the device if not found in cache
-                _LOGGER.debug("Device not found in cache, attempting fresh lookup")
-                await asyncio.sleep(0.5)  # Brief delay before retry
+                 ble_device = self._client_ble_device
+
+            # OPTION C: Fallback to HA Cache (connectable=False for safety)
+            if not ble_device:
+                _LOGGER.debug("No fresh device found, checking HA cache...")
                 ble_device = bluetooth.async_ble_device_from_address(
-                    self.hass, self.mac_address, connectable=True
+                    self.hass, self.mac_address, connectable=False
                 )
-                
+            
             if not ble_device:
                 raise BleakError(f"Could not find Bluetooth device with address {self.mac_address}")
 
@@ -366,7 +378,11 @@ class LionelTrainCoordinator:
                 
                 self._connected = True
                 self._retry_count = 0
-                _LOGGER.info("Connected to Lionel train at %s", self.mac_address)
+                _LOGGER.info("Successfully reconnected to train")
+                
+                # Notify all entities of the reconnection
+                self._notify_state_change()
+                return True
 
             except BleakError as err:
                 _LOGGER.error("Failed to connect to train: %s", err)
@@ -668,53 +684,16 @@ class LionelTrainCoordinator:
             try:
                 _LOGGER.debug("Connection attempt %d/%d", attempt + 1, max_attempts)
                 
-                # Get fresh device reference
-                ble_device = bluetooth.async_ble_device_from_address(
-                    self.hass, self.mac_address, connectable=True
-                )
+                # Try to connect using whatever mechanism _async_connect prefers
+                await self._async_connect()
                 
-                if not ble_device:
-                    if attempt < max_attempts - 1:
-                        wait_time = (attempt + 1) * 1.0  # 1s, 2s, 3s, 4s delays
-                        _LOGGER.debug("Device not found, waiting %s seconds before retry", wait_time)
-                        await asyncio.sleep(wait_time)
-                        continue
-                    else:
-                        raise BleakError(f"Could not find Bluetooth device {self.mac_address}")
-                
-                # Establish fresh connection
-                async with self._lock:
-                    _LOGGER.debug("Establishing connection to %s", self.mac_address)
-                    self._client = await establish_connection(
-                        BleakClientWithServiceCache,
-                        ble_device,
-                        self.mac_address,
-                        max_attempts=3,
-                    )
-                    
-                    # Set up notification handler
-                    try:
-                        await self._client.start_notify(
-                            NOTIFY_CHARACTERISTIC_UUID, self._notification_handler
-                        )
-                    except BleakError:
-                        _LOGGER.debug("Could not set up notifications")
-                    
-                    # Read device information
-                    await self._read_device_info()
-                    
-                    self._connected = True
-                    self._retry_count = 0
-                    _LOGGER.info("Successfully reconnected to train")
-                    
-                    # Notify all entities of the reconnection
-                    self._notify_state_change()
+                if self.connected:
                     return True
-                    
+                
             except BleakError as err:
                 _LOGGER.debug("Connection attempt %d failed: %s", attempt + 1, err)
                 if attempt < max_attempts - 1:
-                    wait_time = (attempt + 1) * 2.0  # 2s, 4s, 6s, 8s delays
+                    wait_time = (attempt + 1) * 1.0  # 1s, 2s, 3s, 4s delays
                     _LOGGER.debug("Waiting %s seconds before retry", wait_time)
                     await asyncio.sleep(wait_time)
                 else:
