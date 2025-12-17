@@ -51,8 +51,8 @@ PLATFORMS: list[Platform] = [
     Platform.SENSOR,
 ]
 
-# Time in seconds to allow state restoration. 
-# If disconnected for longer than this, we reset speed to 0 for safety.
+# Grace period in seconds. If reconnected within this time, resume speed/smoke.
+# Otherwise, reset them to off/0 for safety.
 RESYNC_GRACE_PERIOD = 60.0
 
 
@@ -79,7 +79,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     coordinator = LionelTrainCoordinator(hass, mac_address, name, service_uuid)
 
-    # --- LISTENER ---
     @callback
     def _async_update_ble(
         service_info: BluetoothServiceInfoBleak, change: BluetoothChange
@@ -87,7 +86,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """Update from a Bluetooth advertisement."""
         coordinator.async_set_ble_device(service_info, change)
 
-    # Listen for this device's advertisements
     entry.async_on_unload(
         bluetooth.async_register_callback(
             hass,
@@ -97,9 +95,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
     )
 
-    # --- WATCHDOG & BOOT LOGIC ---
-    
-    # 1. Boot Retry: Ensure we try to connect when HA finishes starting
     async def _on_hass_start(event):
         if not coordinator.connected:
             _LOGGER.debug("HA Started: Attempting delayed connection to Lionel Train")
@@ -109,25 +104,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _on_hass_start)
     )
 
-    # 2. Watchdog: Checks connection every 30s
     async def _async_watchdog(now):
         if not coordinator.connected:
             _LOGGER.debug("🐕 Watchdog: Train disconnected. Triggering scan/connect check.")
             hass.async_create_task(coordinator.async_connect())
         else:
-            # Send Heartbeat to keep the train awake
             hass.async_create_task(coordinator.async_send_heartbeat())
         
-        # Reschedule self for 30 seconds later
         coordinator.watchdog_unsub = async_call_later(hass, 30.0, _async_watchdog)
 
-    # Start the watchdog
     coordinator.watchdog_unsub = async_call_later(hass, 30.0, _async_watchdog)
     
-    # Ensure watchdog stops on unload
     entry.async_on_unload(coordinator.cancel_watchdog)
 
-    # --- INITIAL SETUP ---
     try:
         await coordinator.async_setup()
         _LOGGER.info("Successfully connected to Lionel train at %s", mac_address)
@@ -138,7 +127,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
     async def reload_integration_service(call):
-        """Service to reload the integration for manual recovery."""
         _LOGGER.info("Reloading Lionel integration via service call")
         await hass.config_entries.async_reload(entry.entry_id)
 
@@ -185,8 +173,6 @@ class LionelTrainCoordinator:
         self.watchdog_unsub = None
         self._last_reconnect_attempt = -100.0
         self._client_ble_device = None
-        
-        # Track when we lost connection to determine if we should resume speed
         self._disconnect_time: float = 0.0
 
         # State tracking
@@ -196,7 +182,6 @@ class LionelTrainCoordinator:
         self._horn_on = False
         self._bell_on = False
 
-        # Advanced feature state
         self._master_volume = 5
         self._horn_volume = 5
         self._bell_volume = 5
@@ -208,7 +193,6 @@ class LionelTrainCoordinator:
         self._engine_pitch = 0
         self._smoke_on = False
 
-        # Device info
         self._model_number = None
         self._serial_number = None
         self._firmware_revision = None
@@ -216,14 +200,12 @@ class LionelTrainCoordinator:
         self._software_revision = None
         self._manufacturer_name = None
 
-        # Discovery tracking
         self._discovered_write_char = None
         self._discovered_notify_char = None
         self._discovered_lionchief_service = None
         self._last_notification_hex: str | None = None
 
     def cancel_watchdog(self):
-        """Stop the background watchdog timer."""
         if self.watchdog_unsub:
             self.watchdog_unsub()
             self.watchdog_unsub = None
@@ -233,21 +215,16 @@ class LionelTrainCoordinator:
         service_info: BluetoothServiceInfoBleak,
         change: BluetoothChange,
     ) -> None:
-        """Update the BLE device from an advertisement and trigger reconnect if needed."""
         if change != BluetoothChange.ADVERTISEMENT:
             return
 
         self._client_ble_device = service_info.device
 
-        # Fix desync
         if self._connected and (self._client is None or not self._client.is_connected):
             _LOGGER.debug("State desync: Resetting state.")
             self._connected = False
 
-        if self.connected:
-            return
-
-        if self._lock.locked():
+        if self.connected or self._lock.locked():
             return
 
         now = self.hass.loop.time()
@@ -255,24 +232,18 @@ class LionelTrainCoordinator:
             return
 
         self._last_reconnect_attempt = now
-
-        # Always trigger a connect via HA resolver
         self.hass.async_create_task(self.async_connect())
 
     @property
     def connected(self) -> bool:
-        """Return True if connected to the train."""
         return self._connected and self._client is not None and self._client.is_connected
 
     def _on_disconnected(self, client: BleakClientWithServiceCache) -> None:
-        """Handle disconnection event."""
         _LOGGER.warning("🚂 Disconnected from Lionel train!")
         self._connected = False
         self._client = None
-        
-        # Record time of disconnect for grace period check later
+        # Mark the time of disconnect
         self._disconnect_time = time.monotonic()
-        
         self._notify_state_change()
 
     async def async_setup(self) -> None:
@@ -284,15 +255,12 @@ class LionelTrainCoordinator:
     async def async_shutdown(self) -> None:
         self.cancel_watchdog()
         if self._client:
-            try:
-                await self._client.disconnect()
-            except Exception:
-                pass
+            try: await self._client.disconnect()
+            except Exception: pass
             self._client = None
         self._connected = False
 
     async def async_connect(self) -> None:
-        """Public method to connect. Protected by lock with timeout."""
         try:
             async with asyncio.timeout(20.0):
                 async with self._lock:
@@ -304,13 +272,9 @@ class LionelTrainCoordinator:
         if self.connected:
             return
 
-        # CRITICAL FIX: Aggressive Cleanup. 
         if self._client:
-            _LOGGER.debug("Found lingering client object. Clearing it.")
-            try:
-                await self._client.disconnect()
-            except Exception:
-                pass
+            try: await self._client.disconnect()
+            except Exception: pass
             self._client = None
 
         ble_device = bluetooth.async_ble_device_from_address(
@@ -323,7 +287,6 @@ class LionelTrainCoordinator:
             )
 
         if ble_device is None:
-            _LOGGER.debug("Device not found in HA Bluetooth cache yet.")
             return
 
         try:
@@ -350,7 +313,7 @@ class LionelTrainCoordinator:
             
             _LOGGER.info("✅ Successfully reconnected to Lionel train!")
             
-            # Restore state based on how long we were disconnected
+            # Start resync task
             await self._resync_device_state()
             
             self._notify_state_change()
@@ -362,27 +325,28 @@ class LionelTrainCoordinator:
             raise
 
     async def _resync_device_state(self) -> None:
-        """Resend the last known state to the train after a reconnect."""
+        """Resend state to train. Wait for connection to settle first."""
+        # 1. Wait for BLE stack to stabilize
+        await asyncio.sleep(2.0)
         
-        # Calculate how long we've been disconnected
         time_since_disconnect = time.monotonic() - self._disconnect_time
         _LOGGER.debug("Resyncing state. Disconnected for %.1f seconds.", time_since_disconnect)
         
-        is_safe_restore = time_since_disconnect < RESYNC_GRACE_PERIOD
+        # If _disconnect_time is 0, it means we just booted up HA, so don't resume movement.
+        is_safe_restore = (self._disconnect_time > 0) and (time_since_disconnect < RESYNC_GRACE_PERIOD)
         
-        # 1. Restore Master Volume (Safe to restore always)
+        # Always restore Volume and Lights
         try:
             await self.async_set_master_volume(self._master_volume)
-            await asyncio.sleep(0.2) 
+            await asyncio.sleep(0.2)
         except Exception: pass
 
-        # 2. Restore Lights (Safe to restore always)
         try:
             await self.async_set_lights(self._lights_on)
             await asyncio.sleep(0.2)
         except Exception: pass
 
-        # 3. Restore Smoke (Only if within grace period, otherwise Safety Off)
+        # Smoke: Restore if safe, otherwise Force Off
         if self._smoke_on:
             if is_safe_restore:
                 try:
@@ -390,29 +354,24 @@ class LionelTrainCoordinator:
                     await asyncio.sleep(0.2)
                 except Exception: pass
             else:
-                _LOGGER.info("Resync: Too long since disconnect. Turning smoke OFF for safety.")
-                self._smoke_on = False # Update internal state to match reality
+                _LOGGER.info("Resync: Too long since disconnect. Turning smoke OFF.")
+                self._smoke_on = False
 
-        # 4. Restore Direction (Safe-ish, but usually meaningless if stopped)
-        try:
-            await self.async_set_direction(self._direction_forward)
-            await asyncio.sleep(0.2)
-        except Exception: pass
-
-        # 5. Restore Speed (CRITICAL SAFETY CHECK)
+        # Speed: Restore if safe, otherwise Force Off
         if self._speed > 0:
             if is_safe_restore:
-                _LOGGER.info("Resync: Grace period active. Resuming train speed to %s%%", self._speed)
+                _LOGGER.info("Resync: Resuming train speed to %s%%", self._speed)
                 try:
+                    await self.async_set_direction(self._direction_forward)
+                    await asyncio.sleep(0.2)
                     await self.async_set_speed(self._speed)
                 except Exception: pass
             else:
-                _LOGGER.warning("Resync: Disconnected too long (>%.0fs). Resetting speed to 0 for safety.", RESYNC_GRACE_PERIOD)
-                self._speed = 0 # Update internal state to match reality
+                _LOGGER.info("Resync: Too long since disconnect. Resetting speed to 0.")
+                self._speed = 0
 
     async def _notification_handler(self, sender: int, data: bytearray) -> None:
         self._last_notification_hex = data.hex()
-
         if len(data) >= 8 and data[0] == 0x00 and data[1] == 0x81 and data[2] == 0x02:
             try:
                 self._speed = int((data[3] / 31) * 100)
@@ -444,20 +403,14 @@ class LionelTrainCoordinator:
                 pass
 
     async def async_send_heartbeat(self) -> None:
-        """Send a silent keep-alive command."""
-        if not self.connected:
-            return
-            
+        if not self.connected: return
         hex_speed = int((self._speed / 100) * 31)
         command = build_simple_command(0x45, [hex_speed])
-        
         async with self._lock:
             try:
-                write_char_uuid = WRITE_CHARACTERISTIC_UUID
-                await self._client.write_gatt_char(write_char_uuid, bytearray(command))
-                _LOGGER.debug("💓 Heartbeat sent (Speed: %s%%)", self._speed)
+                await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, bytearray(command))
+                _LOGGER.debug("💓 Heartbeat sent")
             except BleakError:
-                _LOGGER.debug("Heartbeat failed - connection likely dropped")
                 self._connected = False
                 if self._client:
                     try: await self._client.disconnect()
@@ -467,15 +420,10 @@ class LionelTrainCoordinator:
     async def async_send_command(self, command_data: list[int]) -> bool:
         async with self._lock:
             if not self.connected:
-                try:
-                    await self._connect_internal()
-                except BleakError:
-                    return False
-
-            write_char_uuid = WRITE_CHARACTERISTIC_UUID
-            
+                try: await self._connect_internal()
+                except BleakError: return False
             try:
-                await self._client.write_gatt_char(write_char_uuid, bytearray(command_data))
+                await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, bytearray(command_data))
                 self._last_notification_hex = "".join(f"{b:02x}" for b in command_data)
                 self._notify_state_change()
                 return True
@@ -493,8 +441,17 @@ class LionelTrainCoordinator:
         return False
 
     async def async_set_direction(self, forward: bool) -> bool:
-        if await self.async_send_command(build_simple_command(0x46, [0x01 if forward else 0x02])):
+        """Set train direction."""
+        command = build_simple_command(0x46, [0x01 if forward else 0x02])
+        if await self.async_send_command(command):
             self._direction_forward = forward
+            
+            # The train stops physically on direction change.
+            # We must update the throttle UI to 0 to reflect reality.
+            if self._speed > 0:
+                self._speed = 0
+                self._notify_state_change()
+                
             return True
         return False
 
