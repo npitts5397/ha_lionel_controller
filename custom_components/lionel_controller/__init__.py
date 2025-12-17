@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from bleak import BleakError
 from bleak_retry_connector import establish_connection, BleakClientWithServiceCache
@@ -23,7 +24,6 @@ from .const import (
     CMD_SOUND_VOLUME,
     CONF_MAC_ADDRESS,
     CONF_SERVICE_UUID,
-    DEVICE_INFO_SERVICE_UUID,
     DOMAIN,
     FIRMWARE_REVISION_CHAR_UUID,
     HARDWARE_REVISION_CHAR_UUID,
@@ -50,6 +50,10 @@ PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.SENSOR,
 ]
+
+# Time in seconds to allow state restoration. 
+# If disconnected for longer than this, we reset speed to 0 for safety.
+RESYNC_GRACE_PERIOD = 60.0
 
 
 @callback
@@ -181,6 +185,9 @@ class LionelTrainCoordinator:
         self.watchdog_unsub = None
         self._last_reconnect_attempt = -100.0
         self._client_ble_device = None
+        
+        # Track when we lost connection to determine if we should resume speed
+        self._disconnect_time: float = 0.0
 
         # State tracking
         self._speed = 0
@@ -261,6 +268,11 @@ class LionelTrainCoordinator:
         """Handle disconnection event."""
         _LOGGER.warning("🚂 Disconnected from Lionel train!")
         self._connected = False
+        self._client = None
+        
+        # Record time of disconnect for grace period check later
+        self._disconnect_time = time.monotonic()
+        
         self._notify_state_change()
 
     async def async_setup(self) -> None:
@@ -271,26 +283,51 @@ class LionelTrainCoordinator:
 
     async def async_shutdown(self) -> None:
         self.cancel_watchdog()
-        if self._client and self._client.is_connected:
-            await self._client.disconnect()
+        if self._client:
+            try:
+                await self._client.disconnect()
+            except Exception:
+                pass
+            self._client = None
         self._connected = False
 
     async def async_connect(self) -> None:
-        async with self._lock:
-            await self._connect_internal()
+        """Public method to connect. Protected by lock with timeout."""
+        try:
+            async with asyncio.timeout(20.0):
+                async with self._lock:
+                    await self._connect_internal()
+        except asyncio.TimeoutError:
+            _LOGGER.error("Timed out waiting for lock to connect")
 
     async def _connect_internal(self) -> None:
         if self.connected:
             return
+
+        # CRITICAL FIX: Aggressive Cleanup. 
+        if self._client:
+            _LOGGER.debug("Found lingering client object. Clearing it.")
+            try:
+                await self._client.disconnect()
+            except Exception:
+                pass
+            self._client = None
 
         ble_device = bluetooth.async_ble_device_from_address(
             self.hass, self.mac_address, connectable=True
         )
 
         if ble_device is None:
-            raise BleakError(f"Could not find connectable Bluetooth device {self.mac_address}")
+            ble_device = bluetooth.async_ble_device_from_address(
+                self.hass, self.mac_address, connectable=False
+            )
+
+        if ble_device is None:
+            _LOGGER.debug("Device not found in HA Bluetooth cache yet.")
+            return
 
         try:
+            _LOGGER.debug("Attempting connection to %s", self.mac_address)
             self._client = await establish_connection(
                 BleakClientWithServiceCache,
                 ble_device,
@@ -310,12 +347,68 @@ class LionelTrainCoordinator:
 
             self._connected = True
             self._retry_count = 0
+            
+            _LOGGER.info("✅ Successfully reconnected to Lionel train!")
+            
+            # Restore state based on how long we were disconnected
+            await self._resync_device_state()
+            
             self._notify_state_change()
 
         except BleakError as err:
             _LOGGER.error("Failed to connect to train: %s", err)
             self._connected = False
+            self._client = None
             raise
+
+    async def _resync_device_state(self) -> None:
+        """Resend the last known state to the train after a reconnect."""
+        
+        # Calculate how long we've been disconnected
+        time_since_disconnect = time.monotonic() - self._disconnect_time
+        _LOGGER.debug("Resyncing state. Disconnected for %.1f seconds.", time_since_disconnect)
+        
+        is_safe_restore = time_since_disconnect < RESYNC_GRACE_PERIOD
+        
+        # 1. Restore Master Volume (Safe to restore always)
+        try:
+            await self.async_set_master_volume(self._master_volume)
+            await asyncio.sleep(0.2) 
+        except Exception: pass
+
+        # 2. Restore Lights (Safe to restore always)
+        try:
+            await self.async_set_lights(self._lights_on)
+            await asyncio.sleep(0.2)
+        except Exception: pass
+
+        # 3. Restore Smoke (Only if within grace period, otherwise Safety Off)
+        if self._smoke_on:
+            if is_safe_restore:
+                try:
+                    await self.async_set_smoke(True)
+                    await asyncio.sleep(0.2)
+                except Exception: pass
+            else:
+                _LOGGER.info("Resync: Too long since disconnect. Turning smoke OFF for safety.")
+                self._smoke_on = False # Update internal state to match reality
+
+        # 4. Restore Direction (Safe-ish, but usually meaningless if stopped)
+        try:
+            await self.async_set_direction(self._direction_forward)
+            await asyncio.sleep(0.2)
+        except Exception: pass
+
+        # 5. Restore Speed (CRITICAL SAFETY CHECK)
+        if self._speed > 0:
+            if is_safe_restore:
+                _LOGGER.info("Resync: Grace period active. Resuming train speed to %s%%", self._speed)
+                try:
+                    await self.async_set_speed(self._speed)
+                except Exception: pass
+            else:
+                _LOGGER.warning("Resync: Disconnected too long (>%.0fs). Resetting speed to 0 for safety.", RESYNC_GRACE_PERIOD)
+                self._speed = 0 # Update internal state to match reality
 
     async def _notification_handler(self, sender: int, data: bytearray) -> None:
         self._last_notification_hex = data.hex()
@@ -355,7 +448,6 @@ class LionelTrainCoordinator:
         if not self.connected:
             return
             
-        # Re-send the current speed to keep the connection active.
         hex_speed = int((self._speed / 100) * 31)
         command = build_simple_command(0x45, [hex_speed])
         
@@ -367,6 +459,10 @@ class LionelTrainCoordinator:
             except BleakError:
                 _LOGGER.debug("Heartbeat failed - connection likely dropped")
                 self._connected = False
+                if self._client:
+                    try: await self._client.disconnect()
+                    except: pass
+                    self._client = None
 
     async def async_send_command(self, command_data: list[int]) -> bool:
         async with self._lock:
