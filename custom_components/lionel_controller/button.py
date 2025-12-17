@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
@@ -9,8 +10,10 @@ from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from . import LionelTrainCoordinator
 from .const import ANNOUNCEMENTS, DOMAIN
+
+if TYPE_CHECKING:
+    from . import LionelTrainCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -23,20 +26,20 @@ async def async_setup_entry(
     """Set up the Lionel Train button platform."""
     coordinator: LionelTrainCoordinator = hass.data[DOMAIN][config_entry.entry_id]
     name = config_entry.data[CONF_NAME]
-    
+
     buttons = [
         LionelTrainDisconnectButton(coordinator, name),
+        LionelTrainReconnectButton(coordinator, name),
         LionelTrainStopButton(coordinator, name),
         LionelTrainForwardButton(coordinator, name),
         LionelTrainReverseButton(coordinator, name),
     ]
-    
-    # Add announcement buttons
+
     for announcement_name in ANNOUNCEMENTS:
         buttons.append(
             LionelTrainAnnouncementButton(coordinator, name, announcement_name)
         )
-    
+
     async_add_entities(buttons, True)
 
 
@@ -67,13 +70,29 @@ class LionelTrainDisconnectButton(LionelTrainButtonBase):
     _attr_icon = "mdi:bluetooth-off"
 
     def __init__(self, coordinator: LionelTrainCoordinator, device_name: str) -> None:
-        """Initialize the disconnect button."""
         super().__init__(coordinator, device_name)
         self._attr_unique_id = f"{coordinator.mac_address}_disconnect"
 
     async def async_press(self) -> None:
-        """Press the button."""
         await self._coordinator.async_disconnect()
+
+
+class LionelTrainReconnectButton(LionelTrainButtonBase):
+    """Button for forcing a BLE reconnection."""
+
+    _attr_name = "Force Reconnect"
+    _attr_icon = "mdi:bluetooth-connect"
+
+    def __init__(self, coordinator: LionelTrainCoordinator, device_name: str) -> None:
+        super().__init__(coordinator, device_name)
+        self._attr_unique_id = f"{coordinator.mac_address}_force_reconnect"
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    async def async_press(self) -> None:
+        await self._coordinator.async_force_reconnect()
 
 
 class LionelTrainStopButton(LionelTrainButtonBase):
@@ -83,12 +102,10 @@ class LionelTrainStopButton(LionelTrainButtonBase):
     _attr_icon = "mdi:stop"
 
     def __init__(self, coordinator: LionelTrainCoordinator, device_name: str) -> None:
-        """Initialize the stop button."""
         super().__init__(coordinator, device_name)
         self._attr_unique_id = f"{coordinator.mac_address}_stop"
 
     async def async_press(self) -> None:
-        """Press the button."""
         await self._coordinator.async_set_speed(0)
 
 
@@ -99,12 +116,10 @@ class LionelTrainForwardButton(LionelTrainButtonBase):
     _attr_icon = "mdi:arrow-right"
 
     def __init__(self, coordinator: LionelTrainCoordinator, device_name: str) -> None:
-        """Initialize the forward button."""
         super().__init__(coordinator, device_name)
         self._attr_unique_id = f"{coordinator.mac_address}_forward"
 
     async def async_press(self) -> None:
-        """Press the button."""
         await self._coordinator.async_set_direction(True)
 
 
@@ -115,12 +130,10 @@ class LionelTrainReverseButton(LionelTrainButtonBase):
     _attr_icon = "mdi:arrow-left"
 
     def __init__(self, coordinator: LionelTrainCoordinator, device_name: str) -> None:
-        """Initialize the reverse button."""
         super().__init__(coordinator, device_name)
         self._attr_unique_id = f"{coordinator.mac_address}_reverse"
 
     async def async_press(self) -> None:
-        """Press the button."""
         await self._coordinator.async_set_direction(False)
 
 
@@ -130,16 +143,16 @@ class LionelTrainAnnouncementButton(LionelTrainButtonBase):
     _attr_icon = "mdi:bullhorn-variant"
 
     def __init__(
-        self, coordinator: LionelTrainCoordinator, device_name: str, announcement_name: str
+        self,
+        coordinator: LionelTrainCoordinator,
+        device_name: str,
+        announcement_name: str,
     ) -> None:
-        """Initialize the announcement button."""
         super().__init__(coordinator, device_name)
         self._announcement_name = announcement_name
         self._attr_name = f"Announcement {announcement_name}"
         self._attr_unique_id = f"{coordinator.mac_address}_announcement_{announcement_name.lower().replace(' ', '_')}"
 
     async def async_press(self) -> None:
-        """Press the button."""
-        announcement_config = ANNOUNCEMENTS[self._announcement_name]
-        announcement_code = announcement_config["code"]
-        await self._coordinator.async_play_announcement(announcement_code)
+        if announcement_config := ANNOUNCEMENTS.get(self._announcement_name):
+            await self._coordinator.async_play_announcement(announcement_config["code"])
