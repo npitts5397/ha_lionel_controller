@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
 
 from bleak import BleakError
 from bleak_retry_connector import establish_connection, BleakClientWithServiceCache
@@ -14,9 +13,9 @@ from homeassistant.components.bluetooth import (
     BluetoothScanningMode,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_NAME, Platform
+from homeassistant.const import CONF_NAME, Platform, EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers.event import async_call_later
 
 from .const import (
     CMD_MASTER_VOLUME,
@@ -24,8 +23,6 @@ from .const import (
     CMD_SOUND_VOLUME,
     CONF_MAC_ADDRESS,
     CONF_SERVICE_UUID,
-    DEFAULT_RETRY_COUNT,
-    DEFAULT_TIMEOUT,
     DEVICE_INFO_SERVICE_UUID,
     DOMAIN,
     FIRMWARE_REVISION_CHAR_UUID,
@@ -41,7 +38,6 @@ from .const import (
     SOUND_SOURCE_HORN,
     SOUND_SOURCE_SPEECH,
     WRITE_CHARACTERISTIC_UUID,
-    build_command,
     build_simple_command,
 )
 
@@ -79,6 +75,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     coordinator = LionelTrainCoordinator(hass, mac_address, name, service_uuid)
 
+    # --- LISTENER ---
     @callback
     def _async_update_ble(
         service_info: BluetoothServiceInfoBleak, change: BluetoothChange
@@ -96,7 +93,37 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
     )
 
-    # Initial setup: allow load even if locomotive is off
+    # --- WATCHDOG & BOOT LOGIC ---
+    
+    # 1. Boot Retry: Ensure we try to connect when HA finishes starting
+    async def _on_hass_start(event):
+        if not coordinator.connected:
+            _LOGGER.debug("HA Started: Attempting delayed connection to Lionel Train")
+            await coordinator.async_setup()
+
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _on_hass_start)
+    )
+
+    # 2. Watchdog: Checks connection every 30s
+    async def _async_watchdog(now):
+        if not coordinator.connected:
+            _LOGGER.debug("🐕 Watchdog: Train disconnected. Triggering scan/connect check.")
+            hass.async_create_task(coordinator.async_connect())
+        else:
+            # Send Heartbeat to keep the train awake
+            hass.async_create_task(coordinator.async_send_heartbeat())
+        
+        # Reschedule self for 30 seconds later
+        coordinator.watchdog_unsub = async_call_later(hass, 30.0, _async_watchdog)
+
+    # Start the watchdog
+    coordinator.watchdog_unsub = async_call_later(hass, 30.0, _async_watchdog)
+    
+    # Ensure watchdog stops on unload
+    entry.async_on_unload(coordinator.cancel_watchdog)
+
+    # --- INITIAL SETUP ---
     try:
         await coordinator.async_setup()
         _LOGGER.info("Successfully connected to Lionel train at %s", mac_address)
@@ -150,11 +177,9 @@ class LionelTrainCoordinator:
         self._lock = asyncio.Lock()
         self._retry_count = 0
         self._update_callbacks: set[callable] = set()
-
-        # Start negative so first reconnect isn't throttled
+        
+        self.watchdog_unsub = None
         self._last_reconnect_attempt = -100.0
-
-        # BLE device cache from latest advertisement (debug/awareness only)
         self._client_ble_device = None
 
         # State tracking
@@ -174,7 +199,6 @@ class LionelTrainCoordinator:
         self._bell_pitch = 0
         self._speech_pitch = 0
         self._engine_pitch = 0
-
         self._smoke_on = False
 
         # Device info
@@ -185,17 +209,17 @@ class LionelTrainCoordinator:
         self._software_revision = None
         self._manufacturer_name = None
 
-        # Dynamic characteristic discovery
+        # Discovery tracking
         self._discovered_write_char = None
         self._discovered_notify_char = None
         self._discovered_lionchief_service = None
-
-        # Status info
         self._last_notification_hex: str | None = None
 
-    # -------------------------------------------------------------------------
-    # BLE advertisement handling (Option A: advertisement-driven reconnect)
-    # -------------------------------------------------------------------------
+    def cancel_watchdog(self):
+        """Stop the background watchdog timer."""
+        if self.watchdog_unsub:
+            self.watchdog_unsub()
+            self.watchdog_unsub = None
 
     def async_set_ble_device(
         self,
@@ -206,51 +230,27 @@ class LionelTrainCoordinator:
         if change != BluetoothChange.ADVERTISEMENT:
             return
 
-        # Cache the most recent BLEDevice (for debugging, not direct use)
         self._client_ble_device = service_info.device
 
-        # Fix obvious desync: we think connected, but client isn't
+        # Fix desync
         if self._connected and (self._client is None or not self._client.is_connected):
-            _LOGGER.debug(
-                "State desync: _connected=True but client is not connected. Resetting state."
-            )
+            _LOGGER.debug("State desync: Resetting state.")
             self._connected = False
 
-        # If already connected and client agrees, do nothing
         if self.connected:
             return
 
-        # Throttle reconnect attempts
         if self._lock.locked():
-            _LOGGER.debug("Reconnect attempt skipped: lock is held.")
             return
 
         now = self.hass.loop.time()
         if now - self._last_reconnect_attempt < 5.0:
-            _LOGGER.debug("Reconnect attempt skipped: throttled.")
             return
 
         self._last_reconnect_attempt = now
 
-        # We still prefer to see connectable=True, but we won't *use* this device directly.
-        if service_info.connectable:
-            _LOGGER.debug(
-                "Advertisement trigger for %s (connectable=%s). Scheduling auto-reconnect...",
-                self.mac_address,
-                service_info.connectable,
-            )
-        else:
-            _LOGGER.debug(
-                "Advertisement for %s is not marked connectable. Still scheduling reconnect based on HA cache.",
-                self.mac_address,
-            )
-
-        # Critical change: do NOT pass service_info.device; let async_connect use HA resolver.
+        # Always trigger a connect via HA resolver
         self.hass.async_create_task(self.async_connect())
-
-    # -------------------------------------------------------------------------
-    # Connection state and helpers
-    # -------------------------------------------------------------------------
 
     @property
     def connected(self) -> bool:
@@ -263,60 +263,34 @@ class LionelTrainCoordinator:
         self._connected = False
         self._notify_state_change()
 
-    # -------------------------------------------------------------------------
-    # Public API for setup/shutdown/connection
-    # -------------------------------------------------------------------------
-
     async def async_setup(self) -> None:
-        """Set up the coordinator (attempt initial connection)."""
         try:
             await self.async_connect()
         except (BleakError, asyncio.TimeoutError) as err:
             _LOGGER.debug("Initial connection failed during setup: %s", err)
 
     async def async_shutdown(self) -> None:
-        """Shut down the coordinator."""
+        self.cancel_watchdog()
         if self._client and self._client.is_connected:
             await self._client.disconnect()
         self._connected = False
 
     async def async_connect(self) -> None:
-        """Public method to connect. Acquires lock, then calls internal logic."""
         async with self._lock:
             await self._connect_internal()
 
     async def _connect_internal(self) -> None:
-        """Internal connection logic. ASSUMES LOCK IS ALREADY HELD."""
         if self.connected:
-            _LOGGER.debug("Connect requested but already connected; skipping.")
             return
 
-        # Always resolve via HA's connectable cache; this is what works on reload.
-        _LOGGER.debug(
-            "Querying Home Assistant for connectable BLEDevice for %s", self.mac_address
-        )
         ble_device = bluetooth.async_ble_device_from_address(
-            self.hass,
-            self.mac_address,
-            connectable=True,  # critical: must be True to avoid stale devices
+            self.hass, self.mac_address, connectable=True
         )
 
         if ble_device is None:
-            _LOGGER.debug(
-                "No connectable BLEDevice found in HA cache for %s", self.mac_address
-            )
-            raise BleakError(
-                f"Could not find connectable Bluetooth device with address {self.mac_address}"
-            )
-
-        _LOGGER.debug(
-            "Using BLEDevice from HA cache: address=%s connectable=%s",
-            getattr(ble_device, "address", None),
-            getattr(ble_device, "connectable", None),
-        )
+            raise BleakError(f"Could not find connectable Bluetooth device {self.mac_address}")
 
         try:
-            _LOGGER.debug("Establishing connection to %s", self.mac_address)
             self._client = await establish_connection(
                 BleakClientWithServiceCache,
                 ble_device,
@@ -325,28 +299,17 @@ class LionelTrainCoordinator:
                 disconnected_callback=self._on_disconnected,
             )
 
-            # Read device information if available
             await self._read_device_info()
-
-            # Log services/characteristics once per connection for debugging
-            await self._log_ble_characteristics()
-
-            # Set up notification handler for status updates
+            
             try:
-                notify_char_uuid = NOTIFY_CHARACTERISTIC_UUID
                 await self._client.start_notify(
-                    notify_char_uuid, self._notification_handler
+                    NOTIFY_CHARACTERISTIC_UUID, self._notification_handler
                 )
-                _LOGGER.info("📡 Set up notifications on %s", notify_char_uuid)
-            except BleakError as err:
-                _LOGGER.debug(
-                    "Could not set up notifications (train may not support them): %s", err
-                )
+            except BleakError:
+                pass
 
             self._connected = True
             self._retry_count = 0
-            _LOGGER.info("Connected to Lionel train at %s", self.mac_address)
-
             self._notify_state_change()
 
         except BleakError as err:
@@ -354,47 +317,24 @@ class LionelTrainCoordinator:
             self._connected = False
             raise
 
-    # -------------------------------------------------------------------------
-    # Notification handling
-    # -------------------------------------------------------------------------
-
     async def _notification_handler(self, sender: int, data: bytearray) -> None:
-        """Handle notifications from the train."""
-        _LOGGER.debug("Received notification: %s", data.hex())
-
         self._last_notification_hex = data.hex()
 
         if len(data) >= 8 and data[0] == 0x00 and data[1] == 0x81 and data[2] == 0x02:
             try:
                 self._speed = int((data[3] / 31) * 100)
                 self._direction_forward = data[4] == 0x01
-
                 flags = data[7]
                 self._lights_on = (flags & 0x04) != 0
                 self._bell_on = (flags & 0x02) != 0
-
-                _LOGGER.debug(
-                    "Parsed train status: speed=%d%%, forward=%s, lights=%s, bell=%s",
-                    self._speed,
-                    self._direction_forward,
-                    self._lights_on,
-                    self._bell_on,
-                )
-
                 self._notify_state_change()
-
-            except (IndexError, ValueError) as err:
-                _LOGGER.debug("Error parsing train status: %s", err)
+            except (IndexError, ValueError):
+                pass
         else:
             self._notify_state_change()
 
-    # -------------------------------------------------------------------------
-    # Device info / characteristics logging
-    # -------------------------------------------------------------------------
-
     async def _read_device_info(self) -> None:
-        """Read device information characteristics."""
-        device_info_chars = {
+        chars = {
             MODEL_NUMBER_CHAR_UUID: "_model_number",
             SERIAL_NUMBER_CHAR_UUID: "_serial_number",
             FIRMWARE_REVISION_CHAR_UUID: "_firmware_revision",
@@ -402,356 +342,130 @@ class LionelTrainCoordinator:
             SOFTWARE_REVISION_CHAR_UUID: "_software_revision",
             MANUFACTURER_NAME_CHAR_UUID: "_manufacturer_name",
         }
-
-        for char_uuid, attr_name in device_info_chars.items():
+        for uuid, attr in chars.items():
             try:
-                result = await self._client.read_gatt_char(char_uuid)
-                value = result.decode("utf-8", errors="ignore").strip()
-                if value:
-                    setattr(self, attr_name, value)
-                    _LOGGER.debug("Read %s: %s", attr_name, value)
+                res = await self._client.read_gatt_char(uuid)
+                val = res.decode("utf-8", errors="ignore").strip()
+                if val: setattr(self, attr, val)
             except BleakError:
-                _LOGGER.debug("Could not read characteristic %s", char_uuid)
+                pass
 
-    async def _log_ble_characteristics(self) -> None:
-        """Log all BLE services and characteristics for debugging and discover dynamic characteristics."""
-        try:
-            _LOGGER.debug("=== BLE Service Discovery for %s ===", self.mac_address)
-
-            services = self._client.services
-            service_list = list(services)
-            _LOGGER.debug("Found %d services", len(service_list))
-
-            self._discovered_write_char = None
-            self._discovered_notify_char = None
-            self._discovered_lionchief_service = None
-
-            service_count = 0
-            for service in service_list:
-                service_count += 1
-                _LOGGER.debug(
-                    "Service %d: %s (UUID: %s)",
-                    service_count,
-                    service.description,
-                    service.uuid,
-                )
-
-                is_potential_lionchief = (
-                    str(service.uuid).lower()
-                    not in [
-                        "0000180a-0000-1000-8000-00805f9b34fb",  # Device Info
-                        "0000180f-0000-1000-8000-00805f9b34fb",  # Battery
-                        "00001800-0000-1000-8000-00805f9b34fb",  # Generic Access
-                        "00001801-0000-1000-8000-00805f9b34fb",  # Generic Attribute
-                    ]
-                )
-
-                char_count = 0
-                for char in service.characteristics:
-                    char_count += 1
-                    properties = []
-                    has_write = False
-                    has_notify = False
-
-                    if "read" in char.properties:
-                        properties.append("READ")
-                    if "write" in char.properties:
-                        properties.append("WRITE")
-                        has_write = True
-                    if "write-without-response" in char.properties:
-                        properties.append("WRITE-NO-RESP")
-                        has_write = True
-                    if "notify" in char.properties:
-                        properties.append("NOTIFY")
-                        has_notify = True
-                    if "indicate" in char.properties:
-                        properties.append("INDICATE")
-                        has_notify = True
-
-                    _LOGGER.debug(
-                        "  Char %d: %s (UUID: %s) [%s]",
-                        char_count,
-                        char.description,
-                        char.uuid,
-                        ", ".join(properties),
-                    )
-
-                    if is_potential_lionchief:
-                        if has_write and not self._discovered_write_char:
-                            self._discovered_write_char = str(char.uuid)
-                            _LOGGER.debug(
-                                "    *** POTENTIAL LIONCHIEF WRITE CHARACTERISTIC ***"
-                            )
-                        if has_notify and not self._discovered_notify_char:
-                            self._discovered_notify_char = str(char.uuid)
-                            _LOGGER.debug(
-                                "    *** POTENTIAL LIONCHIEF NOTIFY CHARACTERISTIC ***"
-                            )
-
-                        if has_write or has_notify:
-                            self._discovered_lionchief_service = str(service.uuid)
-
-                    if "read" in char.properties:
-                        try:
-                            _LOGGER.debug("    Attempting to read characteristic value...")
-                            value = await self._client.read_gatt_char(char.uuid)
-                            if value and len(value) <= 50:
-                                try:
-                                    decoded = value.decode("utf-8").strip("\x00")
-                                    _LOGGER.debug("    Value (text): '%s'", decoded)
-                                except UnicodeDecodeError:
-                                    _LOGGER.debug("    Value (hex): %s", value.hex())
-                            elif value:
-                                _LOGGER.debug(
-                                    "    Value: <large data, %d bytes>", len(value)
-                                )
-                        except Exception as err:
-                            _LOGGER.debug("    Could not read value: %s", err)
-
-                _LOGGER.debug("  Found %d characteristics in this service", char_count)
-
-            _LOGGER.debug("=== End BLE Service Discovery ===")
-
-            if self._discovered_lionchief_service:
-                _LOGGER.debug(
-                    "🎯 DISCOVERED LIONCHIEF SERVICE: %s",
-                    self._discovered_lionchief_service,
-                )
-            if self._discovered_write_char:
-                _LOGGER.debug(
-                    "🎯 DISCOVERED WRITE CHARACTERISTIC: %s",
-                    self._discovered_write_char,
-                )
-            if self._discovered_notify_char:
-                _LOGGER.debug(
-                    "🎯 DISCOVERED NOTIFY CHARACTERISTIC: %s",
-                    self._discovered_notify_char,
-                )
-
-        except Exception as err:
-            _LOGGER.error("Error during BLE service discovery: %s", err)
-            import traceback
-
-            _LOGGER.error("Full traceback: %s", traceback.format_exc())
-
-    # -------------------------------------------------------------------------
-    # Command sending
-    # -------------------------------------------------------------------------
+    async def async_send_heartbeat(self) -> None:
+        """Send a silent keep-alive command."""
+        if not self.connected:
+            return
+            
+        # Re-send the current speed to keep the connection active.
+        hex_speed = int((self._speed / 100) * 31)
+        command = build_simple_command(0x45, [hex_speed])
+        
+        async with self._lock:
+            try:
+                write_char_uuid = WRITE_CHARACTERISTIC_UUID
+                await self._client.write_gatt_char(write_char_uuid, bytearray(command))
+                _LOGGER.debug("💓 Heartbeat sent (Speed: %s%%)", self._speed)
+            except BleakError:
+                _LOGGER.debug("Heartbeat failed - connection likely dropped")
+                self._connected = False
 
     async def async_send_command(self, command_data: list[int]) -> bool:
-        """Send a command to the train."""
         async with self._lock:
             if not self.connected:
                 try:
                     await self._connect_internal()
-                except BleakError as err:
-                    _LOGGER.error("Failed to connect before sending command: %s", err)
+                except BleakError:
                     return False
 
             write_char_uuid = WRITE_CHARACTERISTIC_UUID
-            max_retries = 3
-
-            for attempt in range(max_retries):
-                try:
-                    await self._client.write_gatt_char(
-                        write_char_uuid, bytearray(command_data)
-                    )
-                    hex_string = "".join(f"{b:02x}" for b in command_data)
-                    _LOGGER.info(
-                        "✅ Sent command successfully to %s: %s (hex: %s)",
-                        write_char_uuid,
-                        command_data,
-                        hex_string,
-                    )
-
-                    self._last_notification_hex = hex_string
-                    self._notify_state_change()
-                    return True
-
-                except BleakError as err:
-                    _LOGGER.warning(
-                        "Failed to send command to %s (attempt %d/%d): %s",
-                        write_char_uuid,
-                        attempt + 1,
-                        max_retries,
-                        err,
-                    )
-                    self._connected = False
-
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(0.5 * (attempt + 1))
-                        try:
-                            await self._connect_internal()
-                        except BleakError:
-                            _LOGGER.debug(
-                                "Reconnection attempt %d failed", attempt + 1
-                            )
-                            continue
-                    else:
-                        _LOGGER.error(
-                            "Failed to send command after %d attempts: %s",
-                            max_retries,
-                            err,
-                        )
-
-            return False
-
-    # -------------------------------------------------------------------------
-    # Public control methods
-    # -------------------------------------------------------------------------
+            
+            try:
+                await self._client.write_gatt_char(write_char_uuid, bytearray(command_data))
+                self._last_notification_hex = "".join(f"{b:02x}" for b in command_data)
+                self._notify_state_change()
+                return True
+            except BleakError:
+                self._connected = False
+                return False
 
     async def async_set_speed(self, speed: int) -> bool:
-        """Set train speed (0-100)."""
-        if not 0 <= speed <= 100:
-            raise ValueError("Speed must be between 0 and 100")
-
+        if not 0 <= speed <= 100: raise ValueError("Speed 0-100")
         hex_speed = int((speed / 100) * 31)
-        command = build_simple_command(0x45, [hex_speed])
-
-        success = await self.async_send_command(command)
-        if success:
+        if await self.async_send_command(build_simple_command(0x45, [hex_speed])):
             self._speed = speed
             self._notify_state_change()
-        return success
+            return True
+        return False
 
     async def async_set_direction(self, forward: bool) -> bool:
-        """Set train direction."""
-        direction_value = 0x01 if forward else 0x02
-        command = build_simple_command(0x46, [direction_value])
-
-        success = await self.async_send_command(command)
-        if success:
+        if await self.async_send_command(build_simple_command(0x46, [0x01 if forward else 0x02])):
             self._direction_forward = forward
-        return success
+            return True
+        return False
 
     async def async_set_lights(self, on: bool) -> bool:
-        """Set train lights."""
-        command = build_simple_command(0x51, [0x01 if on else 0x00])
-        success = await self.async_send_command(command)
-        if success:
+        if await self.async_send_command(build_simple_command(0x51, [0x01 if on else 0x00])):
             self._lights_on = on
-        return success
+            return True
+        return False
 
     async def async_set_horn(self, on: bool) -> bool:
-        """Set train horn."""
-        command = build_simple_command(0x48, [0x01 if on else 0x00])
-        success = await self.async_send_command(command)
-        if success:
+        if await self.async_send_command(build_simple_command(0x48, [0x01 if on else 0x00])):
             self._horn_on = on
-        return success
+            return True
+        return False
 
     async def async_set_bell(self, on: bool) -> bool:
-        """Set train bell."""
-        command = build_simple_command(0x47, [0x01 if on else 0x00])
-        success = await self.async_send_command(command)
-        if success:
+        if await self.async_send_command(build_simple_command(0x47, [0x01 if on else 0x00])):
             self._bell_on = on
-        return success
+            return True
+        return False
 
-    async def async_play_announcement(self, announcement_code: int) -> bool:
-        """Play announcement sound."""
-        command = build_simple_command(0x4D, [announcement_code, 0x00])
-        return await self.async_send_command(command)
+    async def async_play_announcement(self, code: int) -> bool:
+        return await self.async_send_command(build_simple_command(0x4D, [code, 0x00]))
 
     async def async_disconnect(self) -> bool:
-        """Send a disconnect command to train (not BLE disconnect)."""
-        command = build_simple_command(0x4B, [0x00, 0x00])
-        return await self.async_send_command(command)
+        return await self.async_send_command(build_simple_command(0x4B, [0x00, 0x00]))
 
     async def async_force_reconnect(self) -> bool:
-        """Force reconnection to the train."""
-        _LOGGER.info("Force reconnecting to Lionel train at %s", self.mac_address)
-
         self._connected = False
+        self._client_ble_device = None
         if self._client:
-            try:
-                if self._client.is_connected:
-                    await self._client.disconnect()
-                    _LOGGER.debug("Disconnected existing client")
-            except Exception as err:
-                _LOGGER.debug(
-                    "Error disconnecting client (expected if already disconnected): %s",
-                    err,
-                )
-            finally:
-                self._client = None
-
+            try: await self._client.disconnect()
+            except Exception: pass
+            finally: self._client = None
         await asyncio.sleep(1.0)
-
         try:
             await self.async_connect()
             return True
-        except BleakError as err:
-            _LOGGER.error("Force reconnect failed: %s", err)
+        except BleakError:
             return False
 
-    # -------------------------------------------------------------------------
-    # State exposure
-    # -------------------------------------------------------------------------
-
     @property
-    def speed(self) -> int:
-        """Return current speed (0-100)."""
-        return self._speed
-
+    def speed(self) -> int: return self._speed
     @property
-    def direction_forward(self) -> bool:
-        """Return True if direction is forward."""
-        return self._direction_forward
-
+    def direction_forward(self) -> bool: return self._direction_forward
     @property
-    def lights_on(self) -> bool:
-        """Return True if lights are on."""
-        return self._lights_on
-
+    def lights_on(self) -> bool: return self._lights_on
     @property
-    def horn_on(self) -> bool:
-        """Return True if horn is on."""
-        return self._horn_on
-
+    def horn_on(self) -> bool: return self._horn_on
     @property
-    def bell_on(self) -> bool:
-        """Return True if bell is on."""
-        return self._bell_on
-
+    def bell_on(self) -> bool: return self._bell_on
     @property
-    def master_volume(self) -> int:
-        """Return master volume (0-7)."""
-        return self._master_volume
-
+    def master_volume(self) -> int: return self._master_volume
     @property
-    def horn_volume(self) -> int:
-        """Return horn volume (0-7)."""
-        return self._horn_volume
-
+    def horn_volume(self) -> int: return self._horn_volume
     @property
-    def bell_volume(self) -> int:
-        """Return bell volume (0-7)."""
-        return self._bell_volume
-
+    def bell_volume(self) -> int: return self._bell_volume
     @property
-    def speech_volume(self) -> int:
-        """Return speech volume (0-7)."""
-        return self._speech_volume
-
+    def speech_volume(self) -> int: return self._speech_volume
     @property
-    def engine_volume(self) -> int:
-        """Return engine volume (0-7)."""
-        return self._engine_volume
-
+    def engine_volume(self) -> int: return self._engine_volume
     @property
-    def smoke_on(self) -> bool:
-        """Return True if smoke unit is on."""
-        return self._smoke_on
-
+    def smoke_on(self) -> bool: return self._smoke_on
     @property
-    def last_notification_hex(self) -> str | None:
-        """Return the last notification hex string."""
-        return self._last_notification_hex
-
+    def last_notification_hex(self) -> str | None: return self._last_notification_hex
     @property
     def device_info(self) -> dict:
-        """Return device information."""
         return {
             "model": self._model_number or "LionChief Locomotive",
             "manufacturer": self._manufacturer_name or "Lionel",
@@ -760,86 +474,34 @@ class LionelTrainCoordinator:
             "serial_number": self._serial_number,
         }
 
-    # -------------------------------------------------------------------------
-    # Callbacks and state notification
-    # -------------------------------------------------------------------------
-
-    def add_update_callback(self, callback):
-        """Add a callback to be called when the state changes."""
-        self._update_callbacks.add(callback)
-
-    def remove_update_callback(self, callback):
-        """Remove a callback."""
-        self._update_callbacks.discard(callback)
-
+    def add_update_callback(self, callback): self._update_callbacks.add(callback)
+    def remove_update_callback(self, callback): self._update_callbacks.discard(callback)
     def _notify_state_change(self):
-        """Notify all registered callbacks of state changes."""
-        for callback in list(self._update_callbacks):
-            try:
-                callback()
-            except Exception as err:
-                _LOGGER.error("Error calling update callback: %s", err)
-
-    # -------------------------------------------------------------------------
-    # Advanced feature control
-    # -------------------------------------------------------------------------
+        for cb in list(self._update_callbacks):
+            try: cb()
+            except Exception: pass
 
     async def async_set_master_volume(self, volume: int) -> bool:
-        """Set master volume (0-7)."""
-        if not 0 <= volume <= 7:
-            raise ValueError("Volume must be between 0 and 7")
-
-        command = build_simple_command(CMD_MASTER_VOLUME, [volume])
-        success = await self.async_send_command(command)
-        if success:
+        if await self.async_send_command(build_simple_command(CMD_MASTER_VOLUME, [volume])):
             self._master_volume = volume
             self._notify_state_change()
-        return success
+            return True
+        return False
 
-    async def async_set_sound_volume(
-        self, sound_source: int, volume: int, pitch: int | None = None
-    ) -> bool:
-        """Set volume and optionally pitch for specific sound source."""
-        if not 0 <= volume <= 7:
-            raise ValueError("Volume must be between 0 and 7")
-        if pitch is not None and not -2 <= pitch <= 2:
-            raise ValueError("Pitch must be between -2 and 2")
-
-        if pitch is not None:
-            command = build_simple_command(
-                CMD_SOUND_VOLUME, [sound_source, volume, pitch & 0xFF]
-            )
-        else:
-            command = build_simple_command(CMD_SOUND_VOLUME, [sound_source, volume])
-
-        success = await self.async_send_command(command)
-
-        if success:
-            if sound_source == SOUND_SOURCE_HORN:
-                self._horn_volume = volume
-                if pitch is not None:
-                    self._horn_pitch = pitch
-            elif sound_source == SOUND_SOURCE_BELL:
-                self._bell_volume = volume
-                if pitch is not None:
-                    self._bell_pitch = pitch
-            elif sound_source == SOUND_SOURCE_SPEECH:
-                self._speech_volume = volume
-                if pitch is not None:
-                    self._speech_pitch = pitch
-            elif sound_source == SOUND_SOURCE_ENGINE:
-                self._engine_volume = volume
-                if pitch is not None:
-                    self._engine_pitch = pitch
-
+    async def async_set_sound_volume(self, source: int, volume: int, pitch: int = None) -> bool:
+        params = [source, volume, pitch & 0xFF] if pitch else [source, volume]
+        if await self.async_send_command(build_simple_command(CMD_SOUND_VOLUME, params)):
+            if source == SOUND_SOURCE_HORN: self._horn_volume = volume
+            elif source == SOUND_SOURCE_BELL: self._bell_volume = volume
+            elif source == SOUND_SOURCE_SPEECH: self._speech_volume = volume
+            elif source == SOUND_SOURCE_ENGINE: self._engine_volume = volume
             self._notify_state_change()
-        return success
+            return True
+        return False
 
     async def async_set_smoke(self, on: bool) -> bool:
-        """Set smoke unit on/off."""
-        command = build_simple_command(CMD_SMOKE, [0x01 if on else 0x00])
-        success = await self.async_send_command(command)
-        if success:
+        if await self.async_send_command(build_simple_command(CMD_SMOKE, [0x01 if on else 0x00])):
             self._smoke_on = on
             self._notify_state_change()
-        return success
+            return True
+        return False

@@ -5,8 +5,6 @@ import logging
 from typing import Any
 
 import voluptuous as vol
-from bleak import BleakScanner
-from bleak.exc import BleakError
 from homeassistant import config_entries
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import BluetoothServiceInfoBleak
@@ -35,36 +33,30 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 
 
 async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]:
-    """Validate the user input allows us to connect.
-
-    Data has the keys from STEP_USER_DATA_SCHEMA with values provided by the user.
-    """
-    mac_address = data[CONF_MAC_ADDRESS]
+    """Validate the user input allows us to connect."""
+    mac_address = data[CONF_MAC_ADDRESS].upper()
     
     # Validate MAC address format
     if not _is_valid_mac_address(mac_address):
         raise InvalidMacAddress
 
-    # Try to discover the device
-    try:
-        scanner = BleakScanner()
-        devices = await scanner.discover(timeout=10.0)
-        
-        device_found = any(
-            device.address.upper() == mac_address.upper() for device in devices
+    # Use HA's shared cache instead of spawning a new scanner (which causes contention)
+    device = bluetooth.async_ble_device_from_address(
+        hass, mac_address, connectable=True
+    )
+    
+    if not device:
+        # Fallback search for non-connectable (just in case it's in a weird state)
+        device = bluetooth.async_ble_device_from_address(
+            hass, mac_address, connectable=False
         )
-        
-        if not device_found:
-            raise CannotConnect
-            
-    except BleakError as err:
-        _LOGGER.exception("Error discovering Bluetooth devices")
-        raise CannotConnect from err
 
-    # Return info that you want to store in the config entry.
+    if not device:
+        raise CannotConnect
+
     return {
         "title": data[CONF_NAME],
-        "mac_address": mac_address.upper(),
+        "mac_address": mac_address,
         "service_uuid": data[CONF_SERVICE_UUID],
     }
 
@@ -82,7 +74,6 @@ def _is_valid_mac_address(mac: str) -> bool:
             int(part, 16)
         except ValueError:
             return False
-    
     return True
 
 
@@ -112,7 +103,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
             else:
-                # Check if already configured
                 await self.async_set_unique_id(info["mac_address"])
                 self._abort_if_unique_id_configured()
                 
@@ -133,7 +123,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         await self.async_set_unique_id(discovery_info.address)
         self._abort_if_unique_id_configured()
 
-        # Check if this is a Lionel train by service UUID
         lionel_service_found = False
         for service_uuid in discovery_info.service_uuids:
             if service_uuid.lower() == DEFAULT_SERVICE_UUID.lower():
@@ -145,7 +134,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         self._discovered_devices[discovery_info.address] = discovery_info
         
-        # Set context for better user experience
         self.context["title_placeholders"] = {
             "name": discovery_info.name or f"Lionel Train ({discovery_info.address[-5:]})"
         }
@@ -158,11 +146,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Confirm discovery."""
         if user_input is not None:
             discovery_info = self._discovered_devices[self.unique_id]
-            
-            # Try to get device name from discovery or use default
             device_name = discovery_info.name
             if not device_name:
-                # Create a friendly name based on MAC address
                 mac_suffix = discovery_info.address[-5:].replace(":", "")
                 device_name = f"Lionel Train {mac_suffix}"
             
@@ -175,7 +160,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 },
             )
 
-        # Show confirmation form with device details
         discovery_info = self._discovered_devices[self.unique_id]
         device_name = discovery_info.name or f"Lionel Train ({discovery_info.address[-5:]})"
         
@@ -187,10 +171,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             },
         )
 
-
 class CannotConnect(HomeAssistantError):
     """Error to indicate we cannot connect."""
-
 
 class InvalidMacAddress(HomeAssistantError):
     """Error to indicate there is invalid MAC address."""

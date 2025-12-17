@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
@@ -9,8 +10,10 @@ from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from . import LionelTrainCoordinator
 from .const import DOMAIN
+
+if TYPE_CHECKING:
+    from . import LionelTrainCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -23,7 +26,7 @@ async def async_setup_entry(
     """Set up the Lionel Train sensor platform."""
     coordinator: LionelTrainCoordinator = hass.data[DOMAIN][config_entry.entry_id]
     name = config_entry.data[CONF_NAME]
-    
+
     async_add_entities([LionelTrainStatusSensor(coordinator, name)], True)
 
 
@@ -43,12 +46,12 @@ class LionelTrainStatusSensor(SensorEntity):
             "name": device_name,
             **coordinator.device_info,
         }
-        # Register for state updates
-        self._coordinator.add_update_callback(self.async_write_ha_state)
 
-    async def async_will_remove_from_hass(self) -> None:
-        """Entity being removed from hass."""
-        self._coordinator.remove_update_callback(self.async_write_ha_state)
+    async def async_added_to_hass(self) -> None:
+        """Register callbacks."""
+        self.async_on_remove(
+            self._coordinator.add_update_callback(self.async_write_ha_state)
+        )
 
     @property
     def native_value(self) -> str | None:
@@ -64,7 +67,7 @@ class LionelTrainStatusSensor(SensorEntity):
         return self._coordinator.connected
 
     @property
-    def extra_state_attributes(self) -> dict[str, any]:
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return additional state attributes."""
         return {
             "speed": self._coordinator.speed,
