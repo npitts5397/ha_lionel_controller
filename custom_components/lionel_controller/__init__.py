@@ -428,7 +428,7 @@ class LionelTrainCoordinator:
         command = build_simple_command(0x45, [hex_speed])
         async with self._lock:
             try:
-                await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, bytearray(command))
+                await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, bytearray(command), response=False)
                 _LOGGER.debug("💓 Heartbeat sent")
             except BleakError:
                 self._connected = False
@@ -442,7 +442,7 @@ class LionelTrainCoordinator:
                 try: await self._connect_internal()
                 except BleakError: return False
             try:
-                await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, bytearray(command_data))
+                await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, bytearray(command_data), response=False)
                 self._last_notification_hex = "".join(f"{b:02x}" for b in command_data)
                 self._notify_state_change()
                 return True
