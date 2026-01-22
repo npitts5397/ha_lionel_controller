@@ -303,6 +303,73 @@ class LionelTrainCoordinator:
             )
 
         if ble_device is None:
+            return
+
+        try:
+            _LOGGER.debug("Attempting connection to %s...", self.mac_address)
+            self._client = await establish_connection(
+                BleakClientWithServiceCache,
+                ble_device,
+                self.mac_address,
+                max_attempts=3,
+                disconnected_callback=self._on_disconnected,
+            )
+
+            # --- CRITICAL FIX START ---
+            # 1. Mark connected IMMEDIATELY so the Throttle/Switches light up now.
+            # We do this BEFORE reading device info or starting notifications.
+            self._connected = True
+            self._retry_count = 0
+            self._notify_state_change() 
+            # --- CRITICAL FIX END ---
+
+            _LOGGER.debug("Connection established. Reading device info...")
+            
+            # 2. Read device info safely (Non-blocking failure)
+            try:
+                await self._read_device_info()
+            except Exception as e:
+                _LOGGER.warning("Minor warning: Failed to read device info (skipping): %s", e)
+            
+            # 3. Start Notifications
+            try:
+                await self._client.start_notify(
+                    NOTIFY_CHARACTERISTIC_UUID, self._notification_handler
+                )
+            except BleakError as e:
+                _LOGGER.debug("Failed to start notifications: %s", e)
+
+            _LOGGER.info("✅ Successfully connected to Lionel train! Resyncing state...")
+            
+            # 4. Resync state (ensure you reduced the sleep inside this method too!)
+            await self._resync_device_state()
+            
+        except (BleakError, asyncio.TimeoutError) as err:
+            _LOGGER.error("Failed to connect to train: %s", err)
+            self._connected = False
+            self._client = None
+            raise
+        if self.connected:
+            return
+
+        # Clean up any lingering dead client before starting fresh
+        if self._client:
+            _LOGGER.debug("Cleaning up lingering client before new connection attempt.")
+            try: await self._client.disconnect()
+            except Exception: pass
+            self._client = None
+
+        ble_device = bluetooth.async_ble_device_from_address(
+            self.hass, self.mac_address, connectable=True
+        )
+
+        if ble_device is None:
+            # Fallback scan
+            ble_device = bluetooth.async_ble_device_from_address(
+                self.hass, self.mac_address, connectable=False
+            )
+
+        if ble_device is None:
             # Device not visible yet
             return
 
@@ -344,6 +411,48 @@ class LionelTrainCoordinator:
             raise
 
     async def _resync_device_state(self) -> None:
+        """Resend the last known state to the train after a reconnect."""
+        
+        # CHANGE 1: Reduce initial settlement time from 2.0s to 0.5s
+        await asyncio.sleep(0.5)
+        
+        # Guard Check: Are we still connected?
+        if not self.connected:
+            _LOGGER.debug("Connection dropped during settlement wait. Aborting resync.")
+            return
+
+        time_since_disconnect = time.monotonic() - self._disconnect_time
+        _LOGGER.debug("Resyncing state. Disconnected for %.1f seconds.", time_since_disconnect)
+        
+        is_safe_restore = (self._disconnect_time > 0) and (time_since_disconnect < RESYNC_GRACE_PERIOD)
+        
+        try:
+            # CHANGE 2: Removed the 'await asyncio.sleep(0.2)' calls between commands.
+            # Since we are using response=False, we can fire these rapidly.
+            
+            await self.async_set_master_volume(self._master_volume)
+            await self.async_set_lights(self._lights_on)
+
+            # Smoke
+            if self._smoke_on:
+                if is_safe_restore:
+                    await self.async_set_smoke(True)
+                else:
+                    _LOGGER.info("Resync: Smoke OFF for safety.")
+                    self._smoke_on = False
+
+            # Speed
+            if self._speed > 0:
+                if is_safe_restore:
+                    _LOGGER.info("Resync: Resuming speed %s%%", self._speed)
+                    await self.async_set_direction(self._direction_forward)
+                    await self.async_set_speed(self._speed)
+                else:
+                    _LOGGER.info("Resync: Too long since disconnect. Resetting speed to 0.")
+                    self._speed = 0
+                    
+        except Exception as e:
+            _LOGGER.error("Error during state resync: %s", e)    
         """Resend the last known state to the train after a reconnect."""
         
         # 1. Wait for BLE stack to stabilize (Crucial for proxies)
