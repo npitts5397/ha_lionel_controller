@@ -114,9 +114,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         else:
             hass.async_create_task(coordinator.async_send_heartbeat())
         
-        coordinator.watchdog_unsub = async_call_later(hass, 30.0, _async_watchdog)
+        coordinator.watchdog_unsub = async_call_later(hass, 5.0, _async_watchdog)
 
-    coordinator.watchdog_unsub = async_call_later(hass, 30.0, _async_watchdog)
+    coordinator.watchdog_unsub = async_call_later(hass, 5.0, _async_watchdog)
     
     entry.async_on_unload(coordinator.cancel_watchdog)
 
@@ -219,12 +219,19 @@ class LionelTrainCoordinator:
         change: BluetoothChange,
     ) -> None:
         """Update the BLE device from an advertisement."""
+        self._client_ble_device = service_info.device
+
+        if self.connected and service_info.connectable:
+            if (time.monotonic() - self._last_reconnect_attempt) > 5.0:
+                _LOGGER.warning("👻 Phantom connection detected! Train is advertising as connectable. Force resetting.")
+                self._connected = False
+                if self._client:
+                    self.hass.async_create_task(self._client.disconnect())
+                    self._client = None
+
         if change != BluetoothChange.ADVERTISEMENT:
             return
 
-        self._client_ble_device = service_info.device
-
-        # Check for logic desync: We think connected, but client object is gone or dead
         if self._connected and (self._client is None or not self._client.is_connected):
             _LOGGER.debug("State desync: Coordinator thinks connected, but client is not. Resetting.")
             self._connected = False
