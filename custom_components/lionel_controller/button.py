@@ -57,6 +57,12 @@ class LionelTrainButtonBase(ButtonEntity):
             **coordinator.device_info,
         }
 
+    async def async_added_to_hass(self) -> None:
+        """Register callbacks when entity is added."""
+        self.async_on_remove(
+            self._coordinator.add_update_callback(self.async_write_ha_state)
+        )
+
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
@@ -89,6 +95,7 @@ class LionelTrainReconnectButton(LionelTrainButtonBase):
 
     @property
     def available(self) -> bool:
+        """Always available so user can force reconnect even when disconnected."""
         return True
 
     async def async_press(self) -> None:
