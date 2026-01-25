@@ -120,12 +120,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator.watchdog_unsub = async_call_later(hass, 5.0, _async_watchdog)
     entry.async_on_unload(coordinator.cancel_watchdog)
 
-    # CRITICAL FIX: Store coordinator BEFORE trying to connect
+    # Store coordinator BEFORE trying to connect
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
-    # CRITICAL FIX: Load platforms BEFORE initial connection attempt
-    # This allows entities to register and wait for connection
+    # Load platforms BEFORE initial connection attempt
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # Now attempt initial connection (non-blocking)
@@ -183,6 +182,7 @@ class LionelTrainCoordinator:
         self._last_reconnect_attempt = 0.0
         self._client_ble_device = None
         self._disconnect_time: float = 0.0
+        self._reconnect_task: asyncio.Task | None = None
 
         # State tracking
         self._speed = 0
@@ -267,6 +267,44 @@ class LionelTrainCoordinator:
         
         self._disconnect_time = time.monotonic()
         self._notify_state_change()
+        
+        # Start aggressive reconnection loop
+        if not self._reconnect_task or self._reconnect_task.done():
+            self._reconnect_task = self.hass.async_create_task(
+                self._async_reconnect_loop()
+            )
+
+    async def _async_reconnect_loop(self) -> None:
+        """Aggressive reconnection loop after unexpected disconnect."""
+        _LOGGER.info("🔄 Starting aggressive reconnection loop...")
+        attempts = 0
+        max_attempts = 60  # Try for 5 minutes (60 * 5s = 300s)
+        
+        while not self.connected and attempts < max_attempts:
+            attempts += 1
+            
+            # Try to get device from cache
+            ble_device = bluetooth.async_ble_device_from_address(
+                self.hass, self.mac_address, connectable=True
+            )
+            
+            if ble_device:
+                _LOGGER.debug(f"Reconnection attempt {attempts}: Device found in cache")
+                try:
+                    await self.async_connect()
+                    if self.connected:
+                        _LOGGER.info("✅ Reconnection successful!")
+                        return
+                except Exception as err:
+                    _LOGGER.debug(f"Reconnection attempt {attempts} failed: {err}")
+            else:
+                _LOGGER.debug(f"Reconnection attempt {attempts}: Device not in cache yet")
+            
+            # Wait 5 seconds before next attempt
+            await asyncio.sleep(5.0)
+        
+        if not self.connected:
+            _LOGGER.warning(f"⚠️ Gave up reconnecting after {attempts} attempts")
 
     async def _async_disconnect_client(self) -> None:
         """Safely disconnect the client."""
@@ -286,6 +324,11 @@ class LionelTrainCoordinator:
 
     async def async_shutdown(self) -> None:
         self.cancel_watchdog()
+        
+        # Cancel reconnection task if running
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+        
         await self._async_disconnect_client()
         self._connected = False
 
@@ -359,8 +402,8 @@ class LionelTrainCoordinator:
 
             _LOGGER.info("✅ Successfully connected to Lionel train! Resyncing state...")
             
-            # Resync device state
-            await self._resync_device_state()
+            # FIX: Run resync in background so commands work immediately
+            self.hass.async_create_task(self._resync_device_state())
 
         except (BleakError, asyncio.TimeoutError) as err:
             _LOGGER.error("Failed to connect to train: %s", err)
