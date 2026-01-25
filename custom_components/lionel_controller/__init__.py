@@ -105,9 +105,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     async def _async_watchdog(now):
-        # Watchdog to keep connection alive or reconnect
         if not coordinator.connected:
-            _LOGGER.debug("🐕 Watchdog: Train disconnected. Triggering reconnect.")
+            # Only log once per minute to avoid spam
+            current_time = time.monotonic()
+            if current_time - coordinator._last_watchdog_log > 60.0:
+                _LOGGER.debug("🐕 Watchdog: Train disconnected. Monitoring for reconnection.")
+                coordinator._last_watchdog_log = current_time
             hass.async_create_task(coordinator.async_connect())
         else:
             hass.async_create_task(coordinator.async_send_heartbeat())
@@ -176,6 +179,7 @@ class LionelTrainCoordinator:
         self._update_callbacks: set[callable] = set()
         
         self.watchdog_unsub = None
+        self._last_watchdog_log = 0.0
         self._last_reconnect_attempt = 0.0
         self._client_ble_device = None
         self._disconnect_time: float = 0.0

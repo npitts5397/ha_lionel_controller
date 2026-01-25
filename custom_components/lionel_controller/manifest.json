@@ -1,7 +1,7 @@
 {
   "domain": "lionel_controller",
   "name": "Lionel Train Controller",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "documentation": "https://github.com/npitts5397/ha_lionel_controller",
   "issue_tracker": "https://github.com/npitts5397/ha_lionel_controller/issues",
   "dependencies": [],
