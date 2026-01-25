@@ -342,13 +342,18 @@ class LionelTrainCoordinator:
         """Public method to connect. Protected by lock with timeout."""
         try:
             async with asyncio.timeout(30.0):
+                # Lock is ONLY held during actual connection establishment
                 async with self._lock:
                     await self._connect_internal()
+
+                # Device initialization happens OUTSIDE lock so commands work immediately
+                if self.connected:
+                    await self._initialize_device()
         except asyncio.TimeoutError:
             _LOGGER.error("Connection attempt timed out after 30s")
 
     async def _connect_internal(self) -> None:
-        """Internal connection logic. Must be called with lock held."""
+        """Internal connection logic. Must be called with lock held. Only establishes BLE connection."""
         if self.connected:
             return
 
@@ -383,7 +388,7 @@ class LionelTrainCoordinator:
                 disconnected_callback=self._on_disconnected,
             )
 
-            # CRITICAL: Mark connected IMMEDIATELY and release lock
+            # Mark connected and store client
             self._client = client
             self._connected = True
             self._connect_time = time.monotonic()
@@ -397,8 +402,11 @@ class LionelTrainCoordinator:
             self._client = None
             raise
 
-        # === LOCK IS RELEASED HERE ===
-        # Device initialization happens OUTSIDE the lock so commands can be sent immediately
+    async def _initialize_device(self) -> None:
+        """Initialize device after connection. Called OUTSIDE the connection lock."""
+        if not self.connected:
+            _LOGGER.debug("Connection lost before device initialization could complete")
+            return
 
         # Notify state change so entities become available right away
         self._notify_state_change()
