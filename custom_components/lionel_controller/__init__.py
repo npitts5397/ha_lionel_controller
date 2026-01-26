@@ -115,9 +115,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         else:
             hass.async_create_task(coordinator.async_send_heartbeat())
         
-        coordinator.watchdog_unsub = async_call_later(hass, 5.0, _async_watchdog)
+        coordinator.watchdog_unsub = async_call_later(hass, 30.0, _async_watchdog)
 
-    coordinator.watchdog_unsub = async_call_later(hass, 5.0, _async_watchdog)
+    coordinator.watchdog_unsub = async_call_later(hass, 30.0, _async_watchdog)
     entry.async_on_unload(coordinator.cancel_watchdog)
 
     # Store coordinator BEFORE trying to connect
@@ -282,7 +282,7 @@ class LionelTrainCoordinator:
         disconnect_start = time.monotonic()
         _LOGGER.info("🔄 Starting aggressive reconnection loop...")
         attempts = 0
-        max_attempts = 24  # Try for 2 minutes (24 * 5s = 120s)
+        max_attempts = 12  # Try for 1 minute (12 * 5s = 60s), then let watchdog take over
 
         while not self.connected and attempts < max_attempts:
             attempts += 1
@@ -310,7 +310,7 @@ class LionelTrainCoordinator:
 
         if not self.connected:
             disconnect_duration = time.monotonic() - disconnect_start
-            _LOGGER.warning("⚠️ Gave up reconnecting after %.1fs (%d attempts). Watchdog will continue monitoring.", disconnect_duration, attempts)
+            _LOGGER.info("⚠️ Reconnection loop finished after %.1fs (%d attempts). Watchdog will continue monitoring.", disconnect_duration, attempts)
 
     async def _async_disconnect_client(self) -> None:
         """Safely disconnect the client."""
@@ -341,7 +341,7 @@ class LionelTrainCoordinator:
     async def async_connect(self) -> None:
         """Public method to connect. Protected by lock with timeout."""
         try:
-            async with asyncio.timeout(30.0):
+            async with asyncio.timeout(60.0):
                 # Lock is ONLY held during actual connection establishment
                 async with self._lock:
                     await self._connect_internal()
@@ -350,7 +350,7 @@ class LionelTrainCoordinator:
                 if self.connected:
                     await self._initialize_device()
         except asyncio.TimeoutError:
-            _LOGGER.error("Connection attempt timed out after 30s")
+            _LOGGER.error("Connection attempt timed out after 60s")
 
     async def _connect_internal(self) -> None:
         """Internal connection logic. Must be called with lock held. Only establishes BLE connection."""
@@ -411,9 +411,12 @@ class LionelTrainCoordinator:
         # Notify state change so entities become available right away
         self._notify_state_change()
 
-        # Read device info (non-blocking if it fails)
+        # Read device info (non-blocking if it fails, with timeout)
         try:
-            await self._read_device_info()
+            async with asyncio.timeout(5.0):
+                await self._read_device_info()
+        except asyncio.TimeoutError:
+            _LOGGER.debug("Device info read timed out (skipping)")
         except Exception as e:
             _LOGGER.debug("Could not read device info (skipping): %s", e)
 
@@ -432,28 +435,31 @@ class LionelTrainCoordinator:
 
     async def _resync_device_state(self) -> None:
         """Resend the last known state to the train after a reconnect."""
-        
-        # Brief settle time for BLE stack
-        await asyncio.sleep(0.3)
-        
+
+        # Wait for BLE stack to stabilize (crucial for proxies)
+        await asyncio.sleep(2.0)
+
         if not self.connected:
             _LOGGER.debug("Connection dropped during settlement. Aborting resync.")
             return
 
         time_since_disconnect = time.monotonic() - self._disconnect_time
         _LOGGER.debug("Resyncing state. Disconnected for %.1f seconds.", time_since_disconnect)
-        
+
         is_safe_restore = (self._disconnect_time > 0) and (time_since_disconnect < RESYNC_GRACE_PERIOD)
-        
+
         try:
-            # Fire commands rapidly without delays (response=False mode)
+            # Always restore Volume and Lights with delays between commands
             await self.async_set_master_volume(self._master_volume)
+            await asyncio.sleep(0.2)
             await self.async_set_lights(self._lights_on)
+            await asyncio.sleep(0.2)
 
             # Smoke
             if self._smoke_on:
                 if is_safe_restore:
                     await self.async_set_smoke(True)
+                    await asyncio.sleep(0.2)
                 else:
                     _LOGGER.info("Resync: Smoke OFF for safety.")
                     self._smoke_on = False
@@ -463,11 +469,12 @@ class LionelTrainCoordinator:
                 if is_safe_restore:
                     _LOGGER.info("Resync: Resuming speed %s%%", self._speed)
                     await self.async_set_direction(self._direction_forward)
+                    await asyncio.sleep(0.2)
                     await self.async_set_speed(self._speed)
                 else:
                     _LOGGER.info("Resync: Resetting speed to 0 for safety.")
                     self._speed = 0
-                    
+
         except Exception as e:
             _LOGGER.error("Error during state resync: %s", e)
 
@@ -509,14 +516,20 @@ class LionelTrainCoordinator:
             return
         hex_speed = int((self._speed / 100) * 31)
         command = build_simple_command(0x45, [hex_speed])
-        async with self._lock:
-            try:
-                await self._client.write_gatt_char(
-                    WRITE_CHARACTERISTIC_UUID, bytearray(command), response=False
-                )
-                _LOGGER.debug("💓 Heartbeat sent")
-            except BleakError:
-                _LOGGER.debug("Heartbeat failed - connection likely dropped")
+
+        # Try to acquire lock with timeout - don't block forever
+        try:
+            async with asyncio.timeout(2.0):
+                async with self._lock:
+                    try:
+                        await self._client.write_gatt_char(
+                            WRITE_CHARACTERISTIC_UUID, bytearray(command), response=False
+                        )
+                        _LOGGER.debug("💓 Heartbeat sent")
+                    except BleakError:
+                        _LOGGER.debug("Heartbeat failed - connection likely dropped")
+        except asyncio.TimeoutError:
+            _LOGGER.debug("Heartbeat skipped - lock busy")
 
     async def async_send_command(self, command_data: list[int]) -> bool:
         async with self._lock:
