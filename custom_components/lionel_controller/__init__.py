@@ -184,6 +184,8 @@ class LionelTrainCoordinator:
         self._disconnect_time: float = 0.0
         self._connect_time: float = 0.0
         self._reconnect_task: asyncio.Task | None = None
+        self._connection_in_progress = False
+        self._initialization_in_progress = False
 
         # State tracking
         self._speed = 0
@@ -263,14 +265,15 @@ class LionelTrainCoordinator:
         """Handle disconnection event."""
         _LOGGER.warning("🚂 Disconnected from Lionel train!")
         self._connected = False
-        
+        self._initialization_in_progress = False  # Clear initialization flag on disconnect
+
         # Only clear client if it matches the disconnected one
         if self._client == client:
             self._client = None
-        
+
         self._disconnect_time = time.monotonic()
         self._notify_state_change()
-        
+
         # Start aggressive reconnection loop
         if not self._reconnect_task or self._reconnect_task.done():
             self._reconnect_task = self.hass.async_create_task(
@@ -280,12 +283,18 @@ class LionelTrainCoordinator:
     async def _async_reconnect_loop(self) -> None:
         """Aggressive reconnection loop after unexpected disconnect."""
         disconnect_start = time.monotonic()
-        _LOGGER.info("🔄 Starting aggressive reconnection loop...")
+        _LOGGER.info("🔄 Starting reconnection loop...")
         attempts = 0
-        max_attempts = 12  # Try for 1 minute (12 * 5s = 60s), then let watchdog take over
+        max_attempts = 8  # Reduced to 8 attempts with shorter timeout
 
         while not self.connected and attempts < max_attempts:
             attempts += 1
+
+            # Skip if connection already in progress (watchdog might be trying)
+            if self._connection_in_progress:
+                _LOGGER.debug(f"Reconnection attempt {attempts}: Skipping, connection in progress")
+                await asyncio.sleep(5.0)
+                continue
 
             # Try to get device from cache
             ble_device = bluetooth.async_ble_device_from_address(
@@ -293,7 +302,7 @@ class LionelTrainCoordinator:
             )
 
             if ble_device:
-                _LOGGER.debug(f"Reconnection attempt {attempts}/{max_attempts}: Device found in cache")
+                _LOGGER.debug(f"Reconnection attempt {attempts}/{max_attempts}")
                 try:
                     await self.async_connect()
                     if self.connected:
@@ -340,8 +349,18 @@ class LionelTrainCoordinator:
 
     async def async_connect(self) -> None:
         """Public method to connect. Protected by lock with timeout."""
+        # Prevent multiple simultaneous connection attempts
+        if self._connection_in_progress:
+            _LOGGER.debug("Connection already in progress, skipping duplicate attempt")
+            return
+
+        if self.connected:
+            _LOGGER.debug("Already connected, skipping connection attempt")
+            return
+
+        self._connection_in_progress = True
         try:
-            async with asyncio.timeout(60.0):
+            async with asyncio.timeout(20.0):  # Reduced from 60s - establish_connection retries internally
                 # Lock is ONLY held during actual connection establishment
                 async with self._lock:
                     await self._connect_internal()
@@ -350,7 +369,9 @@ class LionelTrainCoordinator:
                 if self.connected:
                     await self._initialize_device()
         except asyncio.TimeoutError:
-            _LOGGER.error("Connection attempt timed out after 60s")
+            _LOGGER.error("Connection attempt timed out after 20s")
+        finally:
+            self._connection_in_progress = False
 
     async def _connect_internal(self) -> None:
         """Internal connection logic. Must be called with lock held. Only establishes BLE connection."""
@@ -363,6 +384,7 @@ class LionelTrainCoordinator:
             await self._async_disconnect_client()
 
         # Get BLE device from HA's cache
+        _LOGGER.debug("Looking up device %s in Bluetooth cache...", self.mac_address)
         ble_device = bluetooth.async_ble_device_from_address(
             self.hass, self.mac_address, connectable=True
         )
@@ -376,10 +398,10 @@ class LionelTrainCoordinator:
             _LOGGER.debug("Device not found in Bluetooth cache yet")
             return
 
-        try:
-            _LOGGER.debug("Attempting connection to %s...", self.mac_address)
+        _LOGGER.debug("Device found in cache. Establishing BLE connection (max 3 attempts)...")
 
-            # Establish connection with retries
+        try:
+            # Establish connection with retries (this function retries internally)
             client = await establish_connection(
                 BleakClientWithServiceCache,
                 ble_device,
@@ -397,7 +419,7 @@ class LionelTrainCoordinator:
             _LOGGER.info("✅ BLE connection established to %s", self.mac_address)
 
         except (BleakError, asyncio.TimeoutError) as err:
-            _LOGGER.error("Failed to connect to train: %s", err)
+            _LOGGER.debug("BLE connection failed: %s", err)
             self._connected = False
             self._client = None
             raise
@@ -408,30 +430,39 @@ class LionelTrainCoordinator:
             _LOGGER.debug("Connection lost before device initialization could complete")
             return
 
-        # Notify state change so entities become available right away
-        self._notify_state_change()
+        # Prevent duplicate initialization
+        if self._initialization_in_progress:
+            _LOGGER.debug("Device initialization already in progress, skipping duplicate")
+            return
 
-        # Read device info (non-blocking if it fails, with timeout)
+        self._initialization_in_progress = True
         try:
-            async with asyncio.timeout(5.0):
-                await self._read_device_info()
-        except asyncio.TimeoutError:
-            _LOGGER.debug("Device info read timed out (skipping)")
-        except Exception as e:
-            _LOGGER.debug("Could not read device info (skipping): %s", e)
+            # Notify state change so entities become available right away
+            self._notify_state_change()
 
-        # Start notifications
-        try:
-            await self._client.start_notify(
-                NOTIFY_CHARACTERISTIC_UUID, self._notification_handler
-            )
-        except BleakError as e:
-            _LOGGER.debug("Could not start notifications: %s", e)
+            # Read device info (non-blocking if it fails, with timeout)
+            try:
+                async with asyncio.timeout(5.0):
+                    await self._read_device_info()
+            except asyncio.TimeoutError:
+                _LOGGER.debug("Device info read timed out (skipping)")
+            except Exception as e:
+                _LOGGER.debug("Could not read device info (skipping): %s", e)
 
-        _LOGGER.info("✅ Device configured. Resyncing state...")
+            # Start notifications
+            try:
+                await self._client.start_notify(
+                    NOTIFY_CHARACTERISTIC_UUID, self._notification_handler
+                )
+            except BleakError as e:
+                _LOGGER.debug("Could not start notifications: %s", e)
 
-        # Run resync in background so commands work immediately
-        self.hass.async_create_task(self._resync_device_state())
+            _LOGGER.info("✅ Device configured. Resyncing state...")
+
+            # Run resync in background so commands work immediately
+            self.hass.async_create_task(self._resync_device_state())
+        finally:
+            self._initialization_in_progress = False
 
     async def _resync_device_state(self) -> None:
         """Resend the last known state to the train after a reconnect."""
