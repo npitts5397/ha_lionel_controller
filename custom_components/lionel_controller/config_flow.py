@@ -1,80 +1,24 @@
 """Config flow for Lionel Train Controller integration."""
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import voluptuous as vol
 from homeassistant import config_entries
-from homeassistant.components import bluetooth
-from homeassistant.components.bluetooth import BluetoothServiceInfoBleak
-from homeassistant.const import CONF_NAME
-from homeassistant.core import HomeAssistant
+from homeassistant.components.bluetooth import (
+    BluetoothServiceInfoBleak,
+    async_discovered_service_info,
+)
+from homeassistant.const import CONF_ADDRESS, CONF_NAME
 from homeassistant.data_entry_flow import FlowResult
-from homeassistant.exceptions import HomeAssistantError
 
 from .const import (
     CONF_MAC_ADDRESS,
     CONF_SERVICE_UUID,
-    DEFAULT_NAME,
     DEFAULT_SERVICE_UUID,
     DOMAIN,
+    LIONCHIEF_SERVICE_UUID,
 )
-
-_LOGGER = logging.getLogger(__name__)
-
-STEP_USER_DATA_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_MAC_ADDRESS): str,
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): str,
-        vol.Optional(CONF_SERVICE_UUID, default=DEFAULT_SERVICE_UUID): str,
-    }
-)
-
-
-async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]:
-    """Validate the user input allows us to connect."""
-    mac_address = data[CONF_MAC_ADDRESS].upper()
-    
-    # Validate MAC address format
-    if not _is_valid_mac_address(mac_address):
-        raise InvalidMacAddress
-
-    # Use HA's shared cache instead of spawning a new scanner (which causes contention)
-    device = bluetooth.async_ble_device_from_address(
-        hass, mac_address, connectable=True
-    )
-    
-    if not device:
-        # Fallback search for non-connectable (just in case it's in a weird state)
-        device = bluetooth.async_ble_device_from_address(
-            hass, mac_address, connectable=False
-        )
-
-    if not device:
-        raise CannotConnect
-
-    return {
-        "title": data[CONF_NAME],
-        "mac_address": mac_address,
-        "service_uuid": data[CONF_SERVICE_UUID],
-    }
-
-
-def _is_valid_mac_address(mac: str) -> bool:
-    """Check if MAC address is valid."""
-    parts = mac.split(":")
-    if len(parts) != 6:
-        return False
-    
-    for part in parts:
-        if len(part) != 2:
-            return False
-        try:
-            int(part, 16)
-        except ValueError:
-            return False
-    return True
 
 
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -86,35 +30,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Initialize the config flow."""
         self._discovered_devices: dict[str, BluetoothServiceInfoBleak] = {}
 
-    async def async_step_user(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Handle the initial step."""
-        errors: dict[str, str] = {}
-
-        if user_input is not None:
-            try:
-                info = await validate_input(self.hass, user_input)
-            except CannotConnect:
-                errors["base"] = "cannot_connect"
-            except InvalidMacAddress:
-                errors[CONF_MAC_ADDRESS] = "invalid_mac"
-            except Exception:  # pylint: disable=broad-except
-                _LOGGER.exception("Unexpected exception")
-                errors["base"] = "unknown"
-            else:
-                await self.async_set_unique_id(info["mac_address"])
-                self._abort_if_unique_id_configured()
-                
-                return self.async_create_entry(title=info["title"], data={
-                    CONF_MAC_ADDRESS: info["mac_address"],
-                    CONF_NAME: info["title"],
-                    CONF_SERVICE_UUID: info["service_uuid"],
-                })
-
-        return self.async_show_form(
-            step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
-        )
+    # ------------------------------------------------------------------
+    # Bluetooth auto-discovery path
+    # ------------------------------------------------------------------
 
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfoBleak
@@ -123,34 +41,30 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         await self.async_set_unique_id(discovery_info.address)
         self._abort_if_unique_id_configured()
 
-        lionel_service_found = False
-        for service_uuid in discovery_info.service_uuids:
-            if service_uuid.lower() == DEFAULT_SERVICE_UUID.lower():
-                lionel_service_found = True
-                break
-        
-        if not lionel_service_found:
+        if not any(
+            uuid.lower() == LIONCHIEF_SERVICE_UUID.lower()
+            for uuid in discovery_info.service_uuids
+        ):
             return self.async_abort(reason="not_lionel_device")
 
         self._discovered_devices[discovery_info.address] = discovery_info
-        
-        self.context["title_placeholders"] = {
-            "name": discovery_info.name or f"Lionel Train ({discovery_info.address[-5:]})"
-        }
-        
+
+        device_name = discovery_info.name or f"Lionel Train ({discovery_info.address[-5:]})"
+        self.context["title_placeholders"] = {"name": device_name}
+
         return await self.async_step_bluetooth_confirm()
 
     async def async_step_bluetooth_confirm(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Confirm discovery."""
+        """Confirm auto-discovered device."""
+        discovery_info = self._discovered_devices[self.unique_id]
+        device_name = discovery_info.name
+        if not device_name:
+            mac_suffix = discovery_info.address[-5:].replace(":", "")
+            device_name = f"Lionel Train {mac_suffix}"
+
         if user_input is not None:
-            discovery_info = self._discovered_devices[self.unique_id]
-            device_name = discovery_info.name
-            if not device_name:
-                mac_suffix = discovery_info.address[-5:].replace(":", "")
-                device_name = f"Lionel Train {mac_suffix}"
-            
             return self.async_create_entry(
                 title=device_name,
                 data={
@@ -160,9 +74,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 },
             )
 
-        discovery_info = self._discovered_devices[self.unique_id]
-        device_name = discovery_info.name or f"Lionel Train ({discovery_info.address[-5:]})"
-        
+        self._set_confirm_only()
         return self.async_show_form(
             step_id="bluetooth_confirm",
             description_placeholders={
@@ -171,8 +83,54 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             },
         )
 
-class CannotConnect(HomeAssistantError):
-    """Error to indicate we cannot connect."""
+    # ------------------------------------------------------------------
+    # Manual / user-initiated path
+    # ------------------------------------------------------------------
 
-class InvalidMacAddress(HomeAssistantError):
-    """Error to indicate there is invalid MAC address."""
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Let the user pick from already-discovered LionChief devices."""
+        if user_input is not None:
+            address = user_input[CONF_ADDRESS]
+            await self.async_set_unique_id(address, raise_on_progress=False)
+            self._abort_if_unique_id_configured()
+
+            discovery_info = self._discovered_devices[address]
+            device_name = discovery_info.name or f"Lionel Train {address[-5:].replace(':', '')}"
+
+            return self.async_create_entry(
+                title=device_name,
+                data={
+                    CONF_MAC_ADDRESS: address,
+                    CONF_NAME: device_name,
+                    CONF_SERVICE_UUID: DEFAULT_SERVICE_UUID,
+                },
+            )
+
+        # Scan through what HA's Bluetooth subsystem has already seen
+        current_addresses = self._async_current_ids(include_ignore=False)
+        for discovery_info in async_discovered_service_info(self.hass, connectable=True):
+            address = discovery_info.address
+            if address in current_addresses or address in self._discovered_devices:
+                continue
+            if any(
+                uuid.lower() == LIONCHIEF_SERVICE_UUID.lower()
+                for uuid in discovery_info.service_uuids
+            ):
+                self._discovered_devices[address] = discovery_info
+
+        if not self._discovered_devices:
+            return self.async_abort(reason="no_devices_found")
+
+        device_names = {
+            addr: info.name or f"Lionel Train ({addr[-5:]})"
+            for addr, info in self._discovered_devices.items()
+        }
+
+        return self.async_show_form(
+            step_id="user",
+            data_schema=vol.Schema(
+                {vol.Required(CONF_ADDRESS): vol.In(device_names)}
+            ),
+        )

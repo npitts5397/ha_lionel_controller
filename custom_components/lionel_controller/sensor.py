@@ -115,7 +115,7 @@ class LionelTrainDiagnosticSensor(SensorEntity):
         """Return connection state."""
         if self._coordinator.connected:
             return "Connected"
-        elif self._coordinator._lock.locked():
+        elif self._coordinator._connection_in_progress:
             return "Connecting"
         else:
             return "Disconnected"

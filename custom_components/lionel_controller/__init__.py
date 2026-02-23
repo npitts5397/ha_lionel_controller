@@ -27,7 +27,6 @@ from .const import (
     DOMAIN,
     FIRMWARE_REVISION_CHAR_UUID,
     HARDWARE_REVISION_CHAR_UUID,
-    LIONCHIEF_SERVICE_UUID,
     MANUFACTURER_NAME_CHAR_UUID,
     MODEL_NUMBER_CHAR_UUID,
     NOTIFY_CHARACTERISTIC_UUID,
@@ -53,21 +52,6 @@ PLATFORMS: list[Platform] = [
 
 # Grace period in seconds. If reconnected within this time, resume speed/smoke.
 RESYNC_GRACE_PERIOD = 60.0
-
-
-@callback
-def _async_discovered_device(
-    service_info: BluetoothServiceInfoBleak, change: BluetoothChange
-) -> bool:
-    """Check if discovered device is a Lionel LionChief locomotive."""
-    if change != BluetoothChange.ADVERTISEMENT:
-        return False
-
-    lionel_service_uuid = LIONCHIEF_SERVICE_UUID.lower()
-    return any(
-        service_uuid.lower() == lionel_service_uuid
-        for service_uuid in service_info.service_uuids
-    )
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -151,6 +135,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         coordinator: LionelTrainCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
         await coordinator.async_shutdown()
+        # Remove the reload service when the last entry is unloaded
+        if not hass.data[DOMAIN]:
+            hass.services.async_remove(DOMAIN, "reload_integration")
 
     return unload_ok
 
@@ -227,16 +214,6 @@ class LionelTrainCoordinator:
         """Update the BLE device from an advertisement."""
         self._client_ble_device = service_info.device
 
-        # Detect phantom connections (but only if we've been "connected" for >10s)
-        # This prevents false positives during the connection establishment phase
-        if self.connected and service_info.connectable:
-            time_since_connect = time.monotonic() - self._connect_time
-            if time_since_connect > 10.0:
-                _LOGGER.warning("👻 Phantom connection detected (connected for %.1fs but device still advertising). Forcing reset.", time_since_connect)
-                self._connected = False
-                if self._client:
-                    self.hass.async_create_task(self._async_disconnect_client())
-
         if change != BluetoothChange.ADVERTISEMENT:
             return
 
@@ -245,7 +222,7 @@ class LionelTrainCoordinator:
             _LOGGER.debug("State desync detected. Resetting connection state.")
             self._connected = False
 
-        if self.connected or self._lock.locked():
+        if self.connected or self._connection_in_progress or self._lock.locked():
             return
 
         # Rate limit reconnection attempts
@@ -292,7 +269,7 @@ class LionelTrainCoordinator:
 
             # Skip if connection already in progress (watchdog might be trying)
             if self._connection_in_progress:
-                _LOGGER.debug(f"Reconnection attempt {attempts}: Skipping, connection in progress")
+                _LOGGER.debug("Reconnection attempt %d: Skipping, connection in progress", attempts)
                 await asyncio.sleep(5.0)
                 continue
 
@@ -302,7 +279,7 @@ class LionelTrainCoordinator:
             )
 
             if ble_device:
-                _LOGGER.debug(f"Reconnection attempt {attempts}/{max_attempts}")
+                _LOGGER.debug("Reconnection attempt %d/%d", attempts, max_attempts)
                 try:
                     await self.async_connect()
                     if self.connected:
@@ -310,9 +287,9 @@ class LionelTrainCoordinator:
                         _LOGGER.info("✅ Reconnection successful after %.1fs (%d attempts)", disconnect_duration, attempts)
                         return
                 except Exception as err:
-                    _LOGGER.debug(f"Reconnection attempt {attempts} failed: {err}")
+                    _LOGGER.debug("Reconnection attempt %d failed: %s", attempts, err)
             else:
-                _LOGGER.debug(f"Reconnection attempt {attempts}/{max_attempts}: Device not in cache yet")
+                _LOGGER.debug("Reconnection attempt %d/%d: Device not in cache yet", attempts, max_attempts)
 
             # Wait 5 seconds before next attempt
             await asyncio.sleep(5.0)
@@ -339,11 +316,15 @@ class LionelTrainCoordinator:
 
     async def async_shutdown(self) -> None:
         self.cancel_watchdog()
-        
-        # Cancel reconnection task if running
+
+        # Cancel reconnection task and wait for it to fully stop before disconnecting
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
-        
+            try:
+                await self._reconnect_task
+            except asyncio.CancelledError:
+                pass
+
         await self._async_disconnect_client()
         self._connected = False
 
@@ -360,7 +341,7 @@ class LionelTrainCoordinator:
 
         self._connection_in_progress = True
         try:
-            async with asyncio.timeout(20.0):  # Reduced from 60s - establish_connection retries internally
+            async with asyncio.timeout(30.0):  # 3 attempts × ~10s each = up to 30s max
                 # Lock is ONLY held during actual connection establishment
                 async with self._lock:
                     await self._connect_internal()
@@ -569,6 +550,9 @@ class LionelTrainCoordinator:
                     await self._connect_internal()
                 except BleakError:
                     return False
+                if not self.connected:
+                    # Device not found in cache — _connect_internal returned without error
+                    return False
             try:
                 await self._client.write_gatt_char(
                     WRITE_CHARACTERISTIC_UUID, bytearray(command_data), response=False
@@ -697,8 +681,11 @@ class LionelTrainCoordinator:
     def add_update_callback(self, callback):
         self._update_callbacks.add(callback)
 
-    def remove_update_callback(self, callback):
-        self._update_callbacks.discard(callback)
+        @callback
+        def _remove():
+            self._update_callbacks.discard(callback)
+
+        return _remove
 
     def _notify_state_change(self):
         for cb in list(self._update_callbacks):
@@ -715,7 +702,7 @@ class LionelTrainCoordinator:
         return False
 
     async def async_set_sound_volume(self, source: int, volume: int, pitch: int = None) -> bool:
-        params = [source, volume, pitch & 0xFF] if pitch else [source, volume]
+        params = [source, volume, pitch & 0xFF] if pitch is not None else [source, volume]
         if await self.async_send_command(build_simple_command(CMD_SOUND_VOLUME, params)):
             if source == SOUND_SOURCE_HORN:
                 self._horn_volume = volume
