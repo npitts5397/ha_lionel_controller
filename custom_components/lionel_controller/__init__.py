@@ -16,6 +16,7 @@ from homeassistant.components.bluetooth import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_NAME, Platform, EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.event import async_call_later
 
 from .const import (
@@ -79,14 +80,32 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
     )
 
-    async def _on_hass_start(event):
-        if not coordinator.connected:
-            _LOGGER.debug("HA Started: Attempting delayed connection to Lionel Train")
-            await coordinator.async_setup()
+    if hass.is_running:
+        # Integration reload: BLE stack is ready, connect immediately.
+        hass.async_create_task(coordinator.async_setup())
+    else:
+        # Initial HA startup: defer until BLE stack is fully up.
+        _hass_start_cancel = None
 
-    entry.async_on_unload(
-        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _on_hass_start)
-    )
+        async def _on_hass_start(_event) -> None:
+            nonlocal _hass_start_cancel
+            _hass_start_cancel = None
+            if not coordinator.connected:
+                _LOGGER.debug("HA Started: Attempting initial connection to Lionel Train")
+                await coordinator.async_setup()
+
+        _hass_start_cancel = hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_STARTED, _on_hass_start
+        )
+
+        @callback
+        def _cancel_hass_start() -> None:
+            nonlocal _hass_start_cancel
+            if _hass_start_cancel is not None:
+                _hass_start_cancel()
+                _hass_start_cancel = None
+
+        entry.async_on_unload(_cancel_hass_start)
 
     async def _async_watchdog(now):
         if not coordinator.connected:
@@ -108,15 +127,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
-    # Load platforms BEFORE initial connection attempt
+    # Load platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
-    # Now attempt initial connection (non-blocking)
-    try:
-        await coordinator.async_setup()
-        _LOGGER.info("Successfully connected to Lionel train at %s", mac_address)
-    except (BleakError, asyncio.TimeoutError) as err:
-        _LOGGER.debug("Initial connection failed (will retry): %s", err)
 
     async def reload_integration_service(call):
         _LOGGER.info("Reloading Lionel integration via service call")
@@ -170,7 +182,6 @@ class LionelTrainCoordinator:
         self._client_ble_device = None
         self._disconnect_time: float = 0.0
         self._connect_time: float = 0.0
-        self._reconnect_task: asyncio.Task | None = None
         self._connection_in_progress = False
         self._initialization_in_progress = False
 
@@ -242,7 +253,7 @@ class LionelTrainCoordinator:
         """Handle disconnection event."""
         _LOGGER.warning("🚂 Disconnected from Lionel train!")
         self._connected = False
-        self._initialization_in_progress = False  # Clear initialization flag on disconnect
+        self._initialization_in_progress = False
 
         # Only clear client if it matches the disconnected one
         if self._client == client:
@@ -250,53 +261,6 @@ class LionelTrainCoordinator:
 
         self._disconnect_time = time.monotonic()
         self._notify_state_change()
-
-        # Start aggressive reconnection loop
-        if not self._reconnect_task or self._reconnect_task.done():
-            self._reconnect_task = self.hass.async_create_task(
-                self._async_reconnect_loop()
-            )
-
-    async def _async_reconnect_loop(self) -> None:
-        """Aggressive reconnection loop after unexpected disconnect."""
-        disconnect_start = time.monotonic()
-        _LOGGER.info("🔄 Starting reconnection loop...")
-        attempts = 0
-        max_attempts = 8  # Reduced to 8 attempts with shorter timeout
-
-        while not self.connected and attempts < max_attempts:
-            attempts += 1
-
-            # Skip if connection already in progress (watchdog might be trying)
-            if self._connection_in_progress:
-                _LOGGER.debug("Reconnection attempt %d: Skipping, connection in progress", attempts)
-                await asyncio.sleep(5.0)
-                continue
-
-            # Try to get device from cache
-            ble_device = bluetooth.async_ble_device_from_address(
-                self.hass, self.mac_address, connectable=True
-            )
-
-            if ble_device:
-                _LOGGER.debug("Reconnection attempt %d/%d", attempts, max_attempts)
-                try:
-                    await self.async_connect()
-                    if self.connected:
-                        disconnect_duration = time.monotonic() - disconnect_start
-                        _LOGGER.info("✅ Reconnection successful after %.1fs (%d attempts)", disconnect_duration, attempts)
-                        return
-                except Exception as err:
-                    _LOGGER.debug("Reconnection attempt %d failed: %s", attempts, err)
-            else:
-                _LOGGER.debug("Reconnection attempt %d/%d: Device not in cache yet", attempts, max_attempts)
-
-            # Wait 5 seconds before next attempt
-            await asyncio.sleep(5.0)
-
-        if not self.connected:
-            disconnect_duration = time.monotonic() - disconnect_start
-            _LOGGER.info("⚠️ Reconnection loop finished after %.1fs (%d attempts). Watchdog will continue monitoring.", disconnect_duration, attempts)
 
     async def _async_disconnect_client(self) -> None:
         """Safely disconnect the client."""
@@ -316,15 +280,6 @@ class LionelTrainCoordinator:
 
     async def async_shutdown(self) -> None:
         self.cancel_watchdog()
-
-        # Cancel reconnection task and wait for it to fully stop before disconnecting
-        if self._reconnect_task and not self._reconnect_task.done():
-            self._reconnect_task.cancel()
-            try:
-                await self._reconnect_task
-            except asyncio.CancelledError:
-                pass
-
         await self._async_disconnect_client()
         self._connected = False
 
@@ -350,7 +305,7 @@ class LionelTrainCoordinator:
                 if self.connected:
                     await self._initialize_device()
         except asyncio.TimeoutError:
-            _LOGGER.error("Connection attempt timed out after 20s")
+            _LOGGER.error("Connection attempt timed out after 30s")
         finally:
             self._connection_in_progress = False
 
@@ -544,15 +499,11 @@ class LionelTrainCoordinator:
             _LOGGER.debug("Heartbeat skipped - lock busy")
 
     async def async_send_command(self, command_data: list[int]) -> bool:
+        if not self.connected:
+            return False
         async with self._lock:
             if not self.connected:
-                try:
-                    await self._connect_internal()
-                except BleakError:
-                    return False
-                if not self.connected:
-                    # Device not found in cache — _connect_internal returned without error
-                    return False
+                return False
             try:
                 await self._client.write_gatt_char(
                     WRITE_CHARACTERISTIC_UUID, bytearray(command_data), response=False
@@ -667,6 +618,18 @@ class LionelTrainCoordinator:
     @property
     def last_notification_hex(self) -> str | None:
         return self._last_notification_hex
+
+    def get_device_info(self, name: str) -> DeviceInfo:
+        """Return a typed DeviceInfo object for entity _attr_device_info."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.mac_address)},
+            name=name,
+            model=self._model_number or "LionChief Locomotive",
+            manufacturer=self._manufacturer_name or "Lionel",
+            sw_version=self._software_revision or None,
+            hw_version=self._hardware_revision or None,
+            serial_number=self._serial_number or None,
+        )
 
     @property
     def device_info(self) -> dict:
