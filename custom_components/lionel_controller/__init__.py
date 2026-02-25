@@ -460,6 +460,7 @@ class LionelTrainCoordinator:
 
     async def _notification_handler(self, sender: int, data: bytearray) -> None:
         self._last_notification_hex = data.hex()
+        _LOGGER.debug("← RX: %s", data.hex())
         if len(data) >= 8 and data[0] == 0x00 and data[1] == 0x81 and data[2] == 0x02:
             try:
                 self._speed = int((data[3] / 31) * 100)
@@ -518,10 +519,12 @@ class LionelTrainCoordinator:
             if not self.connected:
                 return False
             try:
+                hex_str = "".join(f"{b:02x}" for b in command_data)
+                _LOGGER.debug("→ TX: %s", hex_str)
                 await self._client.write_gatt_char(
                     WRITE_CHARACTERISTIC_UUID, bytearray(command_data), response=False
                 )
-                self._last_notification_hex = "".join(f"{b:02x}" for b in command_data)
+                self._last_notification_hex = hex_str
                 self._notify_state_change()
                 return True
             except BleakError:
@@ -546,6 +549,8 @@ class LionelTrainCoordinator:
             if self._speed > 0:
                 self._speed = 0
                 self._notify_state_change()
+            # Allow the locomotive's direction state machine to settle
+            await asyncio.sleep(0.5)
             return True
         return False
 
