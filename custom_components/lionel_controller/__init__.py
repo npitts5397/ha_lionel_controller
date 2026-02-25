@@ -115,9 +115,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.debug("🐕 Watchdog: Train disconnected. Monitoring for reconnection.")
                 coordinator._last_watchdog_log = current_time
             coordinator._connect_task = hass.async_create_task(coordinator.async_connect())
-        else:
-            hass.async_create_task(coordinator.async_send_heartbeat())
-        
+
         coordinator.watchdog_unsub = async_call_later(hass, 30.0, _async_watchdog)
 
     coordinator.watchdog_unsub = async_call_later(hass, 30.0, _async_watchdog)
@@ -491,26 +489,6 @@ class LionelTrainCoordinator:
                     setattr(self, attr, val)
             except BleakError:
                 pass
-
-    async def async_send_heartbeat(self) -> None:
-        if not self.connected:
-            return
-        hex_speed = int((self._speed / 100) * 31)
-        command = build_simple_command(0x45, [hex_speed])
-
-        # Try to acquire lock with timeout - don't block forever
-        try:
-            async with asyncio.timeout(2.0):
-                async with self._lock:
-                    try:
-                        await self._client.write_gatt_char(
-                            WRITE_CHARACTERISTIC_UUID, bytearray(command), response=False
-                        )
-                        _LOGGER.debug("💓 Heartbeat sent")
-                    except BleakError:
-                        _LOGGER.debug("Heartbeat failed - connection likely dropped")
-        except asyncio.TimeoutError:
-            _LOGGER.debug("Heartbeat skipped - lock busy")
 
     async def async_send_command(self, command_data: list[int]) -> bool:
         if not self.connected:
