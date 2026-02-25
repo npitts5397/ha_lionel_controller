@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
@@ -27,31 +27,34 @@ async def async_setup_entry(
     coordinator: LionelTrainCoordinator = hass.data[DOMAIN][config_entry.entry_id]
     name = config_entry.data[CONF_NAME]
 
-    async_add_entities([LionelTrainStatusSensor(coordinator, name)], True)
+    async_add_entities(
+        [
+            LionelTrainStatusSensor(coordinator, name),
+            LionelTrainDiagnosticSensor(coordinator, name),
+        ],
+        True,
+    )
 
 
 class LionelTrainStatusSensor(SensorEntity):
     """Sensor for Lionel Train status information."""
 
     _attr_has_entity_name = True
-    _attr_name = "Status"
-    _attr_icon = "mdi:train"
+    _attr_name = "Last Command"
+    _attr_icon = "mdi:code-braces"
 
     def __init__(self, coordinator: LionelTrainCoordinator, device_name: str) -> None:
         """Initialize the sensor."""
         self._coordinator = coordinator
         self._attr_unique_id = f"{coordinator.mac_address}_status"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, coordinator.mac_address)},
-            "name": device_name,
-            **coordinator.device_info,
-        }
+        self._attr_device_info = coordinator.get_device_info(device_name)
 
     async def async_added_to_hass(self) -> None:
         """Register callbacks."""
         self.async_on_remove(
             self._coordinator.add_update_callback(self.async_write_ha_state)
         )
+        self.async_write_ha_state()
 
     @property
     def native_value(self) -> str | None:
@@ -75,4 +78,58 @@ class LionelTrainStatusSensor(SensorEntity):
             "lights_on": self._coordinator.lights_on,
             "bell_on": self._coordinator.bell_on,
             "horn_on": self._coordinator.horn_on,
+        }
+
+
+class LionelTrainDiagnosticSensor(SensorEntity):
+    """Diagnostic sensor for connection info."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Connection State"
+    _attr_icon = "mdi:information-outline"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = ["Connected", "Disconnected", "Connecting"]
+    _attr_entity_registry_enabled_default = False  # Disabled by default
+
+    def __init__(self, coordinator: LionelTrainCoordinator, device_name: str) -> None:
+        """Initialize the sensor."""
+        self._coordinator = coordinator
+        self._attr_unique_id = f"{coordinator.mac_address}_diagnostics"
+        self._attr_device_info = coordinator.get_device_info(device_name)
+
+    async def async_added_to_hass(self) -> None:
+        """Register callbacks."""
+        self.async_on_remove(
+            self._coordinator.add_update_callback(self.async_write_ha_state)
+        )
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> str:
+        """Return connection state."""
+        if self._coordinator.connected:
+            return "Connected"
+        elif self._coordinator._connection_in_progress:
+            return "Connecting"
+        else:
+            return "Disconnected"
+
+    @property
+    def available(self) -> bool:
+        """Always available to show diagnostic info."""
+        return True
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return diagnostic attributes."""
+        return {
+            "mac_address": self._coordinator.mac_address,
+            "client_connected": self._coordinator._client is not None
+            and self._coordinator._client.is_connected
+            if self._coordinator._client
+            else False,
+            "retry_count": self._coordinator._retry_count,
+            "model": self._coordinator._model_number,
+            "firmware": self._coordinator._firmware_revision,
+            "hardware": self._coordinator._hardware_revision,
         }

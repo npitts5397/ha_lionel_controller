@@ -1,10 +1,10 @@
 {
   "domain": "lionel_controller",
   "name": "Lionel Train Controller",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "documentation": "https://github.com/npitts5397/ha_lionel_controller",
   "issue_tracker": "https://github.com/npitts5397/ha_lionel_controller/issues",
-  "dependencies": [],
+  "dependencies": ["bluetooth_adapters"],
   "config_flow": true,
   "codeowners": ["@npitts5397"],
   "requirements": ["bleak>=0.20.0", "bleak-retry-connector>=3.4.0"],
@@ -12,12 +12,9 @@
     {
       "service_uuid": "e20a39f4-73f5-4bc4-a12f-17d1ad07a961",
       "connectable": true
-    },
-    {
-      "service_uuid": "0000180a-0000-1000-8000-00805f9b34fb",
-      "connectable": false
     }
   ],
+  "integration_type": "device",
   "iot_class": "local_push",
   "quality_scale": "silver"
 }

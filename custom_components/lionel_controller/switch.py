@@ -45,17 +45,14 @@ class LionelTrainSwitchBase(SwitchEntity):
     def __init__(self, coordinator: LionelTrainCoordinator, device_name: str) -> None:
         """Initialize the switch."""
         self._coordinator = coordinator
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, coordinator.mac_address)},
-            "name": device_name,
-            **coordinator.device_info,
-        }
+        self._attr_device_info = coordinator.get_device_info(device_name)
 
     async def async_added_to_hass(self) -> None:
         """Register callbacks."""
         self.async_on_remove(
             self._coordinator.add_update_callback(self.async_write_ha_state)
         )
+        self.async_write_ha_state()
 
     @property
     def available(self) -> bool:
