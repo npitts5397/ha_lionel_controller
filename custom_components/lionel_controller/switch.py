@@ -52,6 +52,7 @@ class LionelTrainSwitchBase(SwitchEntity):
         self.async_on_remove(
             self._coordinator.add_update_callback(self.async_write_ha_state)
         )
+        self.async_write_ha_state()
 
     @property
     def available(self) -> bool:
