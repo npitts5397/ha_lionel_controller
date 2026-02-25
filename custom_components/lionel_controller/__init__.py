@@ -114,7 +114,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if current_time - coordinator._last_watchdog_log > 60.0:
                 _LOGGER.debug("🐕 Watchdog: Train disconnected. Monitoring for reconnection.")
                 coordinator._last_watchdog_log = current_time
-            hass.async_create_task(coordinator.async_connect())
+            coordinator._connect_task = hass.async_create_task(coordinator.async_connect())
         else:
             hass.async_create_task(coordinator.async_send_heartbeat())
         
@@ -184,6 +184,8 @@ class LionelTrainCoordinator:
         self._connect_time: float = 0.0
         self._connection_in_progress = False
         self._initialization_in_progress = False
+        self._connect_task: asyncio.Task | None = None
+        self._resync_task: asyncio.Task | None = None
 
         # State tracking
         self._speed = 0
@@ -243,7 +245,7 @@ class LionelTrainCoordinator:
 
         self._last_reconnect_attempt = now
         _LOGGER.debug("Advertisement received for disconnected device. Triggering reconnect.")
-        self.hass.async_create_task(self.async_connect())
+        self._connect_task = self.hass.async_create_task(self.async_connect())
 
     @property
     def connected(self) -> bool:
@@ -280,6 +282,12 @@ class LionelTrainCoordinator:
 
     async def async_shutdown(self) -> None:
         self.cancel_watchdog()
+        if self._connect_task and not self._connect_task.done():
+            self._connect_task.cancel()
+            self._connect_task = None
+        if self._resync_task and not self._resync_task.done():
+            self._resync_task.cancel()
+            self._resync_task = None
         await self._async_disconnect_client()
         self._connected = False
 
@@ -312,6 +320,11 @@ class LionelTrainCoordinator:
     async def _connect_internal(self) -> None:
         """Internal connection logic. Must be called with lock held. Only establishes BLE connection."""
         if self.connected:
+            return
+
+        # Go quiet if no connectable scanner is available (e.g., ESPHome proxy unplugged)
+        if bluetooth.async_scanner_count(self.hass, connectable=True) == 0:
+            _LOGGER.debug("No connectable Bluetooth scanner available. Skipping connection attempt.")
             return
 
         # Clean up any lingering client
@@ -396,7 +409,7 @@ class LionelTrainCoordinator:
             _LOGGER.info("✅ Device configured. Resyncing state...")
 
             # Run resync in background so commands work immediately
-            self.hass.async_create_task(self._resync_device_state())
+            self._resync_task = self.hass.async_create_task(self._resync_device_state())
         finally:
             self._initialization_in_progress = False
 
