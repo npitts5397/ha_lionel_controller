@@ -654,12 +654,12 @@ class LionelTrainCoordinator:
             "serial_number": self._serial_number,
         }
 
-    def add_update_callback(self, callback):
-        self._update_callbacks.add(callback)
+    def add_update_callback(self, update_callback):
+        self._update_callbacks.add(update_callback)
 
         @callback
         def _remove():
-            self._update_callbacks.discard(callback)
+            self._update_callbacks.discard(update_callback)
 
         return _remove
 
